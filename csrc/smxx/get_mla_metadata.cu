@@ -3,7 +3,7 @@
 #include <cuda_runtime_api.h>
 #include <cutlass/fast_math.h>
 
-#include "utils.h"
+#include "flashmla_utils.h"
 
 __global__ void __launch_bounds__(32, 1, 1)
 get_mla_metadata_kernel(__grid_constant__ const GetDecodingMetadataParams params) {

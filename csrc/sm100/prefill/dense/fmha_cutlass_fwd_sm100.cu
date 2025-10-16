@@ -31,15 +31,21 @@ void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
 void FMHACutlassSM100FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k,
                             at::Tensor v, at::Tensor cumulative_seqlen_q,
                             at::Tensor cumulative_seqlen_kv, at::Tensor o, at::Tensor lse,
-                            int mask_mode_code, float sm_scale, int max_seqlen_q,
-                            int max_seqlen_kv, bool is_varlen) {
+                            int64_t mask_mode_code, double sm_scale, int64_t max_seqlen_q,
+                            int64_t max_seqlen_kv, bool is_varlen) {
+  // cast value here
+  int mask_mode_code_int = static_cast<int>(mask_mode_code);
+  float sm_scale_float = static_cast<float>(sm_scale);
+  int max_seqlen_q_int = static_cast<int>(max_seqlen_q);
+  int max_seqlen_kv_int = static_cast<int>(max_seqlen_kv);
+
   const c10::cuda::OptionalCUDAGuard device_guard(q.device());
   CHECK(q.scalar_type() == k.scalar_type());
   auto scalar_type_in = q.scalar_type();
   auto scalar_type_out = o.scalar_type();
   int head_dim_qk = q.size(-1);
   int head_dim_vo = v.size(-1);
-  MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
+  MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code_int);
 
   if (scalar_type_in == at::ScalarType::BFloat16 &&
       scalar_type_out == at::ScalarType::BFloat16) {
@@ -65,12 +71,12 @@ void FMHACutlassSM100FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tenso
     apply_config([&](auto mask, auto varlen, auto in, auto out) {
       if (head_dim_qk == 192 && head_dim_vo == 128) {
         call_run_fmha_fwd(mask, varlen, in, out, true_type{}, workspace_buffer, q, k, v,
-                          cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale,
-                          max_seqlen_q, max_seqlen_kv);
+                          cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale_float,
+                          max_seqlen_q_int, max_seqlen_kv_int);
       } else if (head_dim_qk == 128 && head_dim_vo == 128) {
         call_run_fmha_fwd(mask, varlen, in, out, false_type{}, workspace_buffer, q, k, v,
-                          cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale,
-                          max_seqlen_q, max_seqlen_kv);
+                          cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale_float,
+                          max_seqlen_q_int, max_seqlen_kv_int);
       } else {
         std::cout << "No kernel instantiated for head_dim_qk=" << head_dim_qk
                   << " head_dim_vo=" << head_dim_vo << std::endl;

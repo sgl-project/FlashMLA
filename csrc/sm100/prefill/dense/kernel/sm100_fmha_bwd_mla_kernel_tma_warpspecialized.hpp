@@ -41,7 +41,7 @@
 #include "cutlass/arch/memory_sm80.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 
-#include "utils.h"  // for IS_SM100
+#include "flashmla_utils.h"  // for IS_SM100
 #include "../collective/fmha_common.hpp"
 
 #include <cmath>

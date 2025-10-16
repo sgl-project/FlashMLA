@@ -5,7 +5,7 @@
 #include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/cluster_launch.hpp>
 
-#include "utils.h"
+#include "flashmla_utils.h"
 #include "components/config.h"
 #include "components/epilogue.h"
 #include "components/helpers.h"

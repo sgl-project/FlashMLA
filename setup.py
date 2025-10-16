@@ -63,7 +63,7 @@ ext_modules.append(
     CUDAExtension(
         name="flash_mla.cuda",
         sources=[
-            "csrc/pybind.cpp",
+            "csrc/python_api.cpp",
             "csrc/smxx/get_mla_metadata.cu",
             "csrc/smxx/mla_combine.cu",
             "csrc/sm90/decode/dense/splitkv_mla.cu",

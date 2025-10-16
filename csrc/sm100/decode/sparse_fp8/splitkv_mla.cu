@@ -6,7 +6,7 @@
 #include <cute/tensor.hpp>
 #include <cute/arch/tmem_allocator_sm100.hpp>
 
-#include "utils.h"
+#include "flashmla_utils.h"
 #include "dequant.h"
 #include "sm100/defines.h"
 #include "sm100/helpers.h"

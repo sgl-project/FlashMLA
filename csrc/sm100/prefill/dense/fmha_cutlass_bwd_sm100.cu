@@ -30,13 +30,18 @@ void FMHACutlassSM100BwdRun(at::Tensor workspace_buffer, at::Tensor d_o, at::Ten
                             at::Tensor v, at::Tensor o, at::Tensor lse,
                             at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
                             at::Tensor dq, at::Tensor dk, at::Tensor dv,
-                            int mask_mode_code, float softmax_scale, int max_seqlen_q, int max_seqlen_kv, bool is_varlen) {
+                            int64_t mask_mode_code, double softmax_scale, int64_t max_seqlen_q, int64_t max_seqlen_kv, bool is_varlen) {
+  // cast value here
+  int mask_mode_code_int = static_cast<int>(mask_mode_code);
+  float softmax_scale_float = static_cast<float>(softmax_scale);
+  int max_seqlen_q_int = static_cast<int>(max_seqlen_q);
+  int max_seqlen_kv_int = static_cast<int>(max_seqlen_kv);
 
   const c10::cuda::OptionalCUDAGuard device_guard(q.device());
 
   int head_dim_qk = q.size(-1);
   int head_dim_vo = v.size(-1);
-  MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
+  MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code_int);
   auto scalar_type_in = q.scalar_type();
   auto scalar_type_out = o.scalar_type();
 
@@ -66,12 +71,13 @@ void FMHACutlassSM100BwdRun(at::Tensor workspace_buffer, at::Tensor d_o, at::Ten
         call_run_fmha_bwd(mask, varlen, in, out, true_type{}, workspace_buffer, d_o, q, k, v, o, lse,
                           cumulative_seqlen_q, cumulative_seqlen_kv,
                           dq, dk, dv,
-                          softmax_scale, max_seqlen_q, max_seqlen_kv);
+                          softmax_scale_float, max_seqlen_q_int, max_seqlen_kv_int);
       } else if (head_dim_qk == 128 && head_dim_vo == 128) {
         call_run_fmha_bwd(mask, varlen, in, out, false_type{}, workspace_buffer, d_o, q, k, v, o, lse,
                           cumulative_seqlen_q, cumulative_seqlen_kv,
                           dq, dk, dv,
-                          softmax_scale, max_seqlen_q, max_seqlen_kv);      }
+                          softmax_scale_float, max_seqlen_q_int, max_seqlen_kv_int);
+      }
       else {
         std::cout << "No kernel instantiated for head_dim_qk=" << head_dim_qk << " head_dim_vo=" << head_dim_vo << std::endl;
       }

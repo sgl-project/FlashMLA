@@ -7,7 +7,7 @@
 #include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/arch/arch.h>
 
-#include "utils.h"
+#include "flashmla_utils.h"
 #include "helpers.h"
 
 namespace sm90 {

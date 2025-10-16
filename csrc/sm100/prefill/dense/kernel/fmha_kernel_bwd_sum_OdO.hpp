@@ -34,7 +34,7 @@
 
 #include "cutlass/cutlass.h"
 #include "cute/layout.hpp"
-#include "utils.h"  // for IS_SM100
+#include "flashmla_utils.h"  // for IS_SM100
 
 namespace cutlass::fmha::kernel {
 

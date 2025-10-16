@@ -6,7 +6,7 @@
 #include <cutlass/numeric_types.h>
 
 #include "params.h"
-#include "utils.h"
+#include "flashmla_utils.h"
 
 using namespace cute;
 

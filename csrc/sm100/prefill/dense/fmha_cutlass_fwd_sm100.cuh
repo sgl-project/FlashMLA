@@ -12,7 +12,7 @@
 #include "kernel/fmha_tile_scheduler.hpp"
 #include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
 
-#include <torch/library.h>
+#include <torch/all.h>
 #include <c10/cuda/CUDAStream.h>
 
 using namespace cute;

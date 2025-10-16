@@ -37,7 +37,7 @@
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cute/arch/tmem_allocator_sm100.hpp"
 
-#include "utils.h"  // for IS_SM100
+#include "flashmla_utils.h"  // for IS_SM100
 #include "../kernel/fmha_options.hpp"
 #include "../kernel/fmha_tile_scheduler.hpp"
 #include "../kernel/fmha_causal_tile_scheduler.hpp"

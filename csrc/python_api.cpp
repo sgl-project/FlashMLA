@@ -3,7 +3,7 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
-#include <torch/python.h>
+#include <torch/all.h>
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -122,11 +122,11 @@ DecodingAttnImplMeta get_attn_impl_meta(
 std::vector<at::Tensor>
 get_mla_decoding_metadata(
     at::Tensor &seqlens_k,
-    const int num_q_tokens_per_head_k,
-    const int h_k,
-    const std::optional<int> h_q,
+    const int64_t num_q_tokens_per_head_k,
+    const int64_t h_k,
+    const std::optional<int64_t> h_q,
     const bool is_fp8_kvcache,
-    const std::optional<int> topk
+    const std::optional<int64_t> topk
 ) {
     bool is_sparse_attn = topk.has_value();
     CHECK_DEVICE(seqlens_k);
@@ -134,6 +134,12 @@ get_mla_decoding_metadata(
     TORCH_CHECK(seqlens_k.dtype() == torch::kInt32);
     if (is_sparse_attn)
         TORCH_CHECK(h_q.has_value(), "num_heads_q must be provided when topk is provided");
+
+    // NOTE(FlamingoPg): cast to int32 here
+    int num_q_tokens_per_head_k_int = static_cast<int>(num_q_tokens_per_head_k);
+    int h_k_int = static_cast<int>(h_k);
+    std::optional<int> h_q_int = h_q.has_value() ? std::make_optional<int>(static_cast<int>(h_q.value())) : std::nullopt;
+    std::optional<int> topk_int = topk.has_value() ? std::make_optional<int>(static_cast<int>(topk.value())) : std::nullopt;
 
     int batch_size = seqlens_k.size(0);
     int *seqlens_k_ptr = seqlens_k.data_ptr<int>();
@@ -143,7 +149,7 @@ get_mla_decoding_metadata(
     int sm_count = dprops->multiProcessorCount;
     Arch arch = {dprops->major, dprops->minor};
     arch.assert_is_supported();
-    DecodingAttnImplMeta attn_impl_meta = get_attn_impl_meta(arch, sm_count, num_q_tokens_per_head_k, h_k, h_q, is_fp8_kvcache, is_sparse_attn);
+    DecodingAttnImplMeta attn_impl_meta = get_attn_impl_meta(arch, sm_count, num_q_tokens_per_head_k_int, h_k_int, h_q_int, is_fp8_kvcache, is_sparse_attn);
 
     auto tile_scheduler_metadata = torch::empty({attn_impl_meta.num_sm_parts, TileSchedulerMetaDataSize}, options);
     auto num_splits = torch::empty({batch_size + 1}, options);
@@ -160,7 +166,7 @@ get_mla_decoding_metadata(
     params.block_size_n = attn_impl_meta.k_block_size;
     params.fixed_overhead_num_blocks = attn_impl_meta.fixed_overhead_num_blocks;
     params.num_sm_parts = attn_impl_meta.num_sm_parts;
-    params.topk = is_sparse_attn ? topk.value() : -1;
+    params.topk = is_sparse_attn ? topk_int.value() : -1;
     run_get_mla_metadata_kernel(params, stream);
 
     return {tile_scheduler_metadata, num_splits};
@@ -170,16 +176,20 @@ std::vector<at::Tensor>
 fwd_kvcache_mla(
     at::Tensor &q,                               // batch_size x seqlen_q x num_heads x head_size
     const at::Tensor &kcache,                    // num_blocks x page_block_size x num_heads_k x head_size (when is_fp8 is False) or num_blocks x num_heads_k x (page_block_size*656) (when is_fp8 is True)
-    const int head_size_v,
+    const int64_t head_size_v,
     const at::Tensor &seqlens_k,                 // batch_size
     const at::Tensor &block_table,               // batch_size x max_num_blocks_per_seq
-    const float softmax_scale,
+    const double softmax_scale,
     bool is_causal,
     const at::Tensor &tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
     const at::Tensor &num_splits,                // batch_size + 1
     const bool &is_fp8,
     const std::optional<at::Tensor> &indices     // None, or batch_size x seqlen_q x topk
 ) {
+    // cast value here
+    const int head_size_v_int = static_cast<int>(head_size_v);
+    const float softmax_scale_float = static_cast<float>(softmax_scale);
+
     bool is_sparse_attn = indices.has_value();
     int topk = is_sparse_attn ? indices->size(-1) : -1;
 
@@ -227,7 +237,7 @@ fwd_kvcache_mla(
     const int num_heads_q = sizes[2];
     const int head_size_k = sizes[3];
     TORCH_CHECK(head_size_k == 576, "Only head_size_k == 576 is supported");
-    TORCH_CHECK(head_size_v == 512, "Only head_size_v == 576 is supported");
+    TORCH_CHECK(head_size_v_int == 512, "Only head_size_v == 512 is supported");
 
     const int max_num_blocks_per_seq = block_table.size(1);
     const int num_blocks = kcache.size(0);
@@ -263,7 +273,7 @@ fwd_kvcache_mla(
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
-    at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v}, opts);
+    at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v_int}, opts);
     at::Tensor softmax_lse = torch::empty({batch_size, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
     CHECK_CONTIGUOUS(softmax_lse);
 
@@ -279,9 +289,9 @@ fwd_kvcache_mla(
     params.q_head_per_hk = num_q_heads_per_hk;
     params.is_causal = is_causal;
     params.d = head_size_k;
-    params.d_v = head_size_v;
-    params.scale_softmax = softmax_scale;
-    params.scale_softmax_log2 = float(softmax_scale * M_LOG2E);
+    params.d_v = head_size_v_int;
+    params.scale_softmax = softmax_scale_float;
+    params.scale_softmax_log2 = float(softmax_scale_float * M_LOG2E);
     params.topk = topk;
     // Set the pointers and strides.
     params.q_ptr = q.data_ptr();
@@ -312,7 +322,7 @@ fwd_kvcache_mla(
 
     const int total_num_splits = batch_size + params.num_sm_parts;
     at::Tensor softmax_lse_accum = torch::empty({total_num_splits, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
-    at::Tensor out_accum = torch::empty({total_num_splits, num_heads, q_seq_per_hk, head_size_v}, opts.dtype(at::kFloat));
+    at::Tensor out_accum = torch::empty({total_num_splits, num_heads, q_seq_per_hk, head_size_v_int}, opts.dtype(at::kFloat));
     CHECK_CONTIGUOUS(softmax_lse_accum);
     CHECK_CONTIGUOUS(out_accum);
     params.total_num_splits = total_num_splits;
@@ -388,9 +398,13 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     const at::Tensor &q,
     const at::Tensor &kv,
     const at::Tensor &indices,
-    float sm_scale,
-    int d_v
+    double sm_scale,
+    int64_t d_v
 ) {
+    // cast value here
+    float sm_scale_float = static_cast<float>(sm_scale);
+    int d_v_int = static_cast<int>(d_v);
+
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9;
     bool is_sm100 = dprops->major == 10;
@@ -421,7 +435,7 @@ std::vector<at::Tensor> sparse_prefill_fwd(
 
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     auto opts = q.options();
-    at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
+    at::Tensor out = torch::empty({s_q, h_q, d_v_int}, opts);
     CHECK_CONTIGUOUS(out);
     
     at::Tensor buf_attn_score, max_logits, lse, p_sum;
@@ -431,8 +445,8 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     CHECK_CONTIGUOUS(lse);
 
     SparsePrefillParams params = {
-        s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
-        sm_scale, sm_scale * 1.44269504f,
+        s_q, s_kv, h_q, h_kv, d_qk, d_v_int, topk,
+        sm_scale_float, sm_scale_float * 1.44269504f,
 
         (cutlass::bfloat16_t*)q.data_ptr(),
         (cutlass::bfloat16_t*)kv.data_ptr(),
@@ -458,15 +472,4 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     }
 
     return {out, max_logits, lse};
-}
-
-
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashMLA";
-    m.def("get_mla_decoding_metadata", &get_mla_decoding_metadata);
-    m.def("fwd_kvcache_mla", &fwd_kvcache_mla);
-    m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
-    m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
-    m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
 }
