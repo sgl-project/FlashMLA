@@ -191,9 +191,11 @@ fwd_kvcache_mla_fp8(
 std::vector<at::Tensor>
 get_mla_decoding_metadata_dense_fp8(
     at::Tensor &seqlens_k,
-    const int num_heads_per_head_k,
-    const int num_heads_k
+    const int64_t num_heads_per_head_k,
+    const int64_t num_heads_k
 ) {
+    int num_heads_per_head_k_int = static_cast<int>(num_heads_per_head_k);
+    int num_heads_k_int = static_cast<int>(num_heads_k);
     // This should match the logic in the MLA kernel.
     static constexpr int block_size_m = 64;
     static constexpr int block_size_n = 64;
@@ -206,7 +208,7 @@ get_mla_decoding_metadata_dense_fp8(
     auto options = seqlens_k.options();
     auto dprops = at::cuda::getCurrentDeviceProperties();
     int sm_count = dprops->multiProcessorCount;
-    int num_sm_parts = sm_count / num_heads_k / cutlass::ceil_div(num_heads_per_head_k, block_size_m);
+    int num_sm_parts = sm_count / num_heads_k_int / cutlass::ceil_div(num_heads_per_head_k_int, block_size_m);
     auto tile_scheduler_metadata = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
     auto num_splits = torch::empty({batch_size + 1}, options);
     int *tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();

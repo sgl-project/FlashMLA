@@ -22,6 +22,6 @@ extern
 std::vector<at::Tensor>
 get_mla_decoding_metadata_dense_fp8(
     at::Tensor &seqlens_k,
-    const int num_heads_per_head_k,
-    const int num_heads_k
+    const int64_t num_heads_per_head_k,
+    const int64_t num_heads_k
 );
