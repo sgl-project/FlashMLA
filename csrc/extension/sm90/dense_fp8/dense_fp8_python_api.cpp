@@ -25,7 +25,7 @@ fwd_kvcache_mla_fp8(
     const std::optional<at::Tensor> &descale_q,  // None or batch_size
     const std::optional<at::Tensor> &descale_k   // None or batch_size
 ) {
-    int head_size_v_int = static_cast<int>(head_size_v)
+    int head_size_v_int = static_cast<int>(head_size_v);
 
     // Check the architecture
     auto dprops = at::cuda::getCurrentDeviceProperties();
