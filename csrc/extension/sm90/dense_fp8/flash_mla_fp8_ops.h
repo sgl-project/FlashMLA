@@ -14,7 +14,7 @@ std::vector<at::Tensor>
 fwd_kvcache_mla_fp8(
     at::Tensor &q,                               // batch_size x seqlen_q x num_heads x head_size
     const at::Tensor &kcache,                    // num_blocks x num_heads_k x (page_block_size*656) (when is_fp8 is True)
-    const int head_size_v,
+    const int64_t head_size_v,
     const at::Tensor &seqlens_k,                 // batch_size
     const at::Tensor &block_table,               // batch_size x max_num_blocks_per_seq
     const double softmax_scale,
@@ -24,6 +24,8 @@ fwd_kvcache_mla_fp8(
     const std::optional<at::Tensor> &descale_q,  // None or batch_size
     const std::optional<at::Tensor> &descale_k   // None or batch_size
 ) {
+    int head_size_v_int = static_cast<int>(head_size_v)
+
     // Check the architecture
     auto dprops = at::cuda::getCurrentDeviceProperties();
     TORCH_CHECK(dprops->major == 9 && dprops->minor == 0, "Dense FP8 MLA is only supported on SM90");
@@ -60,7 +62,7 @@ fwd_kvcache_mla_fp8(
     const int num_heads_q = sizes[2];
     const int head_size_k = sizes[3];
     TORCH_CHECK(head_size_k == 576, "Only head_size_k == 576 is supported");
-    TORCH_CHECK(head_size_v == 512, "Only head_size_v == 512 is supported");
+    TORCH_CHECK(head_size_v_int == 512, "Only head_size_v == 512 is supported");
 
     const int max_num_blocks_per_seq = block_table.size(1);
     const int num_blocks = kcache.size(0);
@@ -102,7 +104,7 @@ fwd_kvcache_mla_fp8(
     auto opts = q.options();
     caffe2::TypeMeta out_type;
     out_type = torch::kBFloat16;
-    at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v}, opts.dtype(out_type));
+    at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v_int}, opts.dtype(out_type));
     at::Tensor softmax_lse = torch::empty({batch_size, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
     CHECK_CONTIGUOUS(softmax_lse);
 
@@ -119,7 +121,7 @@ fwd_kvcache_mla_fp8(
     params.q_head_per_hk = num_q_heads_per_hk;
     params.is_causal = is_causal;
     params.d = head_size_k;
-    params.d_v = head_size_v;
+    params.d_v = head_size_v_int;
     params.scale_softmax = static_cast<float>(softmax_scale);
     params.scale_softmax_log2 = float(static_cast<float>(softmax_scale) * M_LOG2E);
     params.topk = -1; // Dense attention
@@ -160,7 +162,7 @@ fwd_kvcache_mla_fp8(
     // Set up accumulation tensors
     const int total_num_splits = batch_size + params.num_sm_parts;
     at::Tensor softmax_lse_accum = torch::empty({total_num_splits, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
-    at::Tensor out_accum = torch::empty({total_num_splits, num_heads, q_seq_per_hk, head_size_v}, opts.dtype(at::kFloat));
+    at::Tensor out_accum = torch::empty({total_num_splits, num_heads, q_seq_per_hk, head_size_v_int}, opts.dtype(at::kFloat));
     CHECK_CONTIGUOUS(softmax_lse_accum);
     CHECK_CONTIGUOUS(out_accum);
     params.total_num_splits = total_num_splits;
@@ -177,8 +179,8 @@ fwd_kvcache_mla_fp8(
 #endif
 
     // Reshape outputs back to original format
-    out = out.view({batch_size, seqlen_q_ori, num_q_heads_per_hk, num_heads_k, head_size_v}).transpose(2, 3)
-            .reshape({batch_size, seqlen_q_ori, num_heads_q, head_size_v});
+    out = out.view({batch_size, seqlen_q_ori, num_q_heads_per_hk, num_heads_k, head_size_v_int}).transpose(2, 3)
+            .reshape({batch_size, seqlen_q_ori, num_heads_q, head_size_v_int});
     softmax_lse = softmax_lse.view({batch_size, num_heads_k, seqlen_q_ori, num_q_heads_per_hk}).transpose(2, 3)
             .reshape({batch_size, num_heads_q, seqlen_q_ori});
 
