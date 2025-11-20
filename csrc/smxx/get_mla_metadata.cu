@@ -188,17 +188,8 @@ void run_get_mla_metadata_kernel(GetDecodingMetadataParams &params, cudaStream_t
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
     
-    printf("[flashmla_debug] batch_size=%d, smem_size=%d bytes (%.2f KB), max_smem_optin=%d bytes (%.2f KB), topk=%d\n",
-           params.batch_size,
-           smem_size, smem_size / 1024.0,
-           max_smem, max_smem / 1024.0,
-           params.topk);
-    fflush(stdout);
-    
     if (smem_size <= max_smem) {
         // Fast path: shared memory available, use high-performance kernel
-        printf("[flashmla_debug] Using high-performance shared memory kernel\n");
-        fflush(stdout);
         CHECK_CUDA(cudaFuncSetAttribute(
             get_mla_metadata_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -207,7 +198,7 @@ void run_get_mla_metadata_kernel(GetDecodingMetadataParams &params, cudaStream_t
         CHECK_CUDA_KERNEL_LAUNCH();
     } else {
         // Fallback path: batch size exceeds shared memory limit
-        printf("[flashmla_debug] batch_size=%d exceeds shared mem limit, "
+        printf("[WARNING] batch_size=%d exceeds shared mem limit, "
                "falling back to low-smem kernel\n",
                params.batch_size);
         fflush(stdout);
