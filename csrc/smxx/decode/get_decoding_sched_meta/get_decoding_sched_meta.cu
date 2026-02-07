@@ -4,8 +4,6 @@
 #include <cutlass/fast_math.h>
 #include <kerutils/kerutils.cuh>
 
-#include "flashmla_utils.h"
-
 namespace smxx::decode {
 
 __global__ void __launch_bounds__(32, 1, 1)

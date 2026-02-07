@@ -1,7 +1,5 @@
 #include <cutlass/cutlass.h>
 
-#include "flashmla_utils.h"
-
 #include "params.h"
 #include "config.h"
 #include "traits.h"
