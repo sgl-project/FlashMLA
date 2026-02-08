@@ -1,6 +1,7 @@
 #pragma once
 
 #include "params.h"
+#include "flashmla_utils.h"
 
 namespace smxx::decode {
 

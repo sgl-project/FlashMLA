@@ -3,6 +3,7 @@
 #include "params.h"
 #include "config.h"
 #include "traits.h"
+#include "flashmla_utils.h"
 
 using namespace cute;
 using cutlass::arch::NamedBarrier;
