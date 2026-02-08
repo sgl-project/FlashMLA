@@ -9,8 +9,8 @@
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// FP8-specific extension of the original DecodingParams
-struct DecodingParams_fp8 : public DecodingParams {
+// FP8-specific extension of the original DenseAttnDecodeParams
+struct DecodingParams_fp8 : public DenseAttnDecodeParams {
     int h_h_k_ratio;
     float* __restrict__ descale_q_ptr = nullptr;
     float* __restrict__ descale_k_ptr = nullptr;
