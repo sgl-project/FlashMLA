@@ -4,7 +4,7 @@
 #include <cutlass/fast_math.h>
 #include <kerutils/kerutils.cuh>
 
-#include "utils.h"
+#include "flashmla_utils.h"
 
 namespace smxx::decode {
 
