@@ -103,7 +103,12 @@ std::vector<at::Tensor> fwd_kvcache_mla(
     const at::Tensor& tile_scheduler_metadata,
     const at::Tensor& num_splits,
     const bool& is_fp8,
-    const std::optional<at::Tensor>& indices) {
+    const std::optional<at::Tensor>& indices,
+    const std::optional<at::Tensor>& attn_sink = std::nullopt,
+    const std::optional<at::Tensor>& extra_k_cache = std::nullopt,
+    const std::optional<at::Tensor>& extra_indices_in_kvcache = std::nullopt,
+    const std::optional<at::Tensor>& topk_length = std::nullopt,
+    const std::optional<at::Tensor>& extra_topk_length = std::nullopt) {
     const int head_size_v_int = static_cast<int>(head_size_v);
     const float softmax_scale_float = static_cast<float>(softmax_scale);
 
@@ -116,13 +121,13 @@ std::vector<at::Tensor> fwd_kvcache_mla(
             q,
             kcache,
             indices.value(),
-            std::nullopt,
-            std::nullopt,
+            topk_length,
+            attn_sink,
             tile_scheduler_metadata_opt,
             num_splits_opt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
             head_size_v_int,
             softmax_scale_float);
         return {std::get<0>(result), std::get<1>(result)};
@@ -130,6 +135,11 @@ std::vector<at::Tensor> fwd_kvcache_mla(
 
     TORCH_CHECK(!is_fp8,
                 "Dense FP8 decode is exposed via fwd_kvcache_mla_fp8, not fwd_kvcache_mla");
+    TORCH_CHECK(!attn_sink.has_value(), "attn_sink is only supported for sparse decode");
+    TORCH_CHECK(!extra_k_cache.has_value(), "extra_k_cache is only supported for sparse decode");
+    TORCH_CHECK(!extra_indices_in_kvcache.has_value(), "extra_indices_in_kvcache is only supported for sparse decode");
+    TORCH_CHECK(!topk_length.has_value(), "topk_length is only supported for sparse decode");
+    TORCH_CHECK(!extra_topk_length.has_value(), "extra_topk_length is only supported for sparse decode");
     auto result = dense_attn_decode_interface(
         q,
         kcache,
@@ -148,15 +158,17 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     const at::Tensor& kv,
     const at::Tensor& indices,
     double sm_scale,
-    int64_t d_v) {
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink = std::nullopt,
+    const std::optional<at::Tensor>& topk_length = std::nullopt) {
     auto result = sparse_attn_prefill_interface(
         q,
         kv,
         indices,
         static_cast<float>(sm_scale),
         static_cast<int>(d_v),
-        std::nullopt,
-        std::nullopt);
+        attn_sink,
+        topk_length);
     // Keep SGL compatibility: this API historically returns max_logits/lse in log2 space.
     result[1].mul_(LOG_2_E);
     result[2].mul_(LOG_2_E);
