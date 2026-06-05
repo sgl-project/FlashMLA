@@ -207,7 +207,7 @@ KernelTemplate<MODEL_TYPE>
                 plan.bar_valid_coord_free[rs.index_buf_idx].arrive();
                 cur_pi_max = max(cur_pi_max, plan.rowwise_max_buf[idx_in_warpgroup^64]);
                 real_mi = max(real_mi, cur_pi_max);
-                bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
+                bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 3.0f);
 
                 // Calc scale factor, and scale li
                 float new_max, scale_for_old;
@@ -664,11 +664,6 @@ KernelTemplate<MODEL_TYPE>
         } else {
             run_main_loop([&](const MainLoopArgs &args) {});
         }
-    } else {
-        // Warpgroup 2: Idle in BF16 mode (NoPE loads directly with TMA swizzle, no dequant needed)
-        cutlass::arch::warpgroup_reg_alloc<208>();
-
-        run_main_loop([&](const MainLoopArgs &args) {});
     }
 #else
     if (cute::thread0()) {

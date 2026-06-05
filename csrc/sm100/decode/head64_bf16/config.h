@@ -45,8 +45,8 @@ static constexpr int B_H = 64;
 static constexpr int B_TOPK = 64;
 static constexpr int NUM_BUFS = 2;
 static constexpr int NUM_INDEX_BUFS = 4;
-// BF16 mode: no dequant warpgroup needed, but we keep 3 warpgroups for NoPE producer
-static constexpr int NUM_THREADS = 128*3;
+// BF16 mode: no dequant warpgroup needed, 2 warpgroups suffice
+static constexpr int NUM_THREADS = 128*2;
 static constexpr float MAX_INIT_VAL = -1e30f;
 
 static constexpr int D_Q_SW128 = 512;
