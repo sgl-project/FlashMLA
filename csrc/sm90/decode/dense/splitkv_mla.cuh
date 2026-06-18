@@ -202,12 +202,12 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
     bool &cur_phase,
     int idx_in_warpgroup
 ) {
-    Tensor sQ_tiled = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, _64>{})(_, _, _0{}, _);	// (BLOCK_SIZE_M, 64, 9)
-    Tensor sKV_tiled = flat_divide(sKV, Shape<Int<T::PAGE_BLOCK_SIZE>, _64>{})(_, _, _0{}, _);	// (PAGE_BLOCK_SIZE, 64, 9)
+    Tensor sQ_tiled = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, _64>{})(_, _, _0{}, _);	// (BLOCK_SIZE_M, 64, NUM_TILES_DIM_K)
+    Tensor sKV_tiled = flat_divide(sKV, Shape<Int<T::PAGE_BLOCK_SIZE>, _64>{})(_, _, _0{}, _);	// (PAGE_BLOCK_SIZE, 64, NUM_TILES_DIM_K)
     TiledMMA tiled_mma_sQ = (typename T::TiledMMA_QK_sQ){};
     ThrMMA thr_mma_sQ = tiled_mma_sQ.get_slice(idx_in_warpgroup);
-    Tensor thr_mma_sQ_tiled = thr_mma_sQ.partition_fragment_A(sQ_tiled);	// (MMA, 1, 4, 9)
-    Tensor thr_mma_sKV_tiled = thr_mma_sQ.partition_fragment_B(sKV_tiled);	// (MMA, 1, 4, 9)
+    Tensor thr_mma_sQ_tiled = thr_mma_sQ.partition_fragment_A(sQ_tiled);	// (MMA, 1, 4, NUM_TILES_DIM_K)
+    Tensor thr_mma_sKV_tiled = thr_mma_sQ.partition_fragment_B(sKV_tiled);	// (MMA, 1, 4, NUM_TILES_DIM_K)
     TiledMMA tiled_mma_rQ = (typename T::TiledMMA_QK_rQ){};
 
     #define QKT_GEMM_ONE_TILE(TILE_IDX) \
@@ -226,7 +226,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(2);
         QKT_GEMM_ONE_TILE(3);
     } else if constexpr (PHASE_IDX == 1) {
-        // In PHASE-1, warpgroup 1 calculates Q K^T for all the 9 tiles
+        // In PHASE-1, warpgroup 1 calculates Q K^T for all K tiles (8 without RoPE tail, 9 with)
         tiled_mma_sQ.accumulate_ = GMMA::ScaleOut::Zero;
         tiled_mma_rQ.accumulate_ = GMMA::ScaleOut::One;
         QKT_GEMM_ONE_TILE(4);
@@ -242,7 +242,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(3);
         cur_phase ^= 1;
     } else {
-        // In PHASE-2, warpgroup 0 calculates Q K^T for the last 5 tiles
+        // In PHASE-2, warpgroup 0 calculates Q K^T for the last tiles (4 without RoPE tail, 5 with)
         static_assert(PHASE_IDX == 2);
         tiled_mma_sQ.accumulate_ = GMMA::ScaleOut::One;
         tiled_mma_rQ.accumulate_ = GMMA::ScaleOut::One;
@@ -272,8 +272,8 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_no_pipeline(
 ) {
     TiledMMA tiled_mma = (typename T::TiledMMA_QK_sQ){};
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
-    Tensor thr_mma_sQ = thr_mma.partition_fragment_A(sQ);	// (MMA, 1, 576/16=36)
-    Tensor thr_mma_sKV = thr_mma.partition_fragment_B(sKV);	// (MMA, 1, 576/16=36)
+    Tensor thr_mma_sQ = thr_mma.partition_fragment_A(sQ);	// (MMA, 1, HEAD_DIM_K/16)
+    Tensor thr_mma_sKV = thr_mma.partition_fragment_B(sKV);	// (MMA, 1, HEAD_DIM_K/16)
     gemm<true, -1>(tiled_mma, thr_mma_sQ, thr_mma_sKV, rP);
 }
 
