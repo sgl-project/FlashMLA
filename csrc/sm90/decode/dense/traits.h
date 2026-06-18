@@ -21,6 +21,8 @@ struct Traits {
 
     static constexpr int TILE_SIZE_K = 64;
     static constexpr int NUM_TILES_DIM_K = HEAD_DIM_K / TILE_SIZE_K;
+    static_assert(HEAD_DIM_K % TILE_SIZE_K == 0, "HEAD_DIM_K must be a multiple of TILE_SIZE_K");
+    static_assert(HEAD_DIM_K >= HEAD_DIM_V, "HEAD_DIM_K must be >= HEAD_DIM_V");
     // REUSE_ROPE = true when the K head has a RoPE tail tile that can overlap with sQ's last tile (saves smem for sP1).
     static constexpr bool REUSE_ROPE = (TILE_SIZE_K == PAGE_BLOCK_SIZE)
                                     && (TILE_SIZE_K == (HEAD_DIM_K - HEAD_DIM_V));
