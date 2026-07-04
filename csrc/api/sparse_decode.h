@@ -19,6 +19,7 @@ enum class DecodeFeatures : int {
     HEAD_DIM_512,
 
     V32_KVCACHE_FORMAT,
+    V32_NO_ROPE_KVCACHE_FORMAT,
     MODEL1_KVCACHE_FORMAT,
 
     ATTN_SINK,
@@ -48,6 +49,7 @@ class Decode_Sm90_Impl : public DecodeImplBase {
         DecodeFeatures::HEAD_DIM_512,
         DecodeFeatures::HEAD_DIM_576,
         DecodeFeatures::V32_KVCACHE_FORMAT,
+        DecodeFeatures::V32_NO_ROPE_KVCACHE_FORMAT,
         DecodeFeatures::MODEL1_KVCACHE_FORMAT,
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
@@ -81,6 +83,7 @@ class Decode_Sm100_Head64_Impl : public DecodeImplBase {
         DecodeFeatures::HEAD_DIM_512,
         DecodeFeatures::HEAD_DIM_576,
         DecodeFeatures::V32_KVCACHE_FORMAT,
+        DecodeFeatures::V32_NO_ROPE_KVCACHE_FORMAT,
         DecodeFeatures::MODEL1_KVCACHE_FORMAT,
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
@@ -115,6 +118,7 @@ class Decode_Sm100_Head64x2_Impl : public DecodeImplBase {
         DecodeFeatures::HEAD_DIM_512,
         DecodeFeatures::HEAD_DIM_576,
         DecodeFeatures::V32_KVCACHE_FORMAT,
+        DecodeFeatures::V32_NO_ROPE_KVCACHE_FORMAT,
         DecodeFeatures::MODEL1_KVCACHE_FORMAT,
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
@@ -283,16 +287,22 @@ sparse_attn_decode_interface(
     KU_CHECK_LAST_DIM_CONTIGUOUS(extra_indices);
     KU_CHECK_CONTIGUOUS(extra_topk_length);
     
+    const int bytes_per_token_v32 = 512 + 64*2 + (512/128)*4; // 656
+    const int bytes_per_token_v32_no_rope = 512 + (512/128)*4; // 528
+    const int bytes_per_token_model1 = 448 + 64*2 + (448/64)*1 + 1; // 584
+
+
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
     {
         int bytes_per_token;
         if (d_qk == 576 && d_v == 512) {
             // V3.2 style
-            bytes_per_token = 512 + 64*2 + (512/128)*4;
+            bytes_per_token = bytes_per_token_v32;
         } else if (d_qk == 512 && d_v == 512) {
-            // MODEL1 style
-            bytes_per_token = 448 + 64*2 + (448/64)*1 + 1;
+            // V3.2_NO_ROPE orMODEL1 style
+            TORCH_CHECK(kv.size(-1) == bytes_per_token_model1 || kv.size(-1) == bytes_per_token_v32_no_rope, "Unsupported kv head sizes for is_fp8_kvcache == True");
+            bytes_per_token = kv.size(-1);
         } else {
             TORCH_CHECK(false, "Unsupported head sizes for is_fp8_kvcache == True");
         }
@@ -319,7 +329,11 @@ sparse_attn_decode_interface(
     if (d_qk == 576) {
         model_type = ModelType::V32;
     } else if (d_qk == 512) {
-        model_type = ModelType::MODEL1;
+        if (kv.size(-1) == bytes_per_token_v32_no_rope) {
+            model_type = ModelType::V32_NO_ROPE;
+        } else {
+            model_type = ModelType::MODEL1;
+        }
     } else {
         TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
     }
@@ -341,6 +355,8 @@ sparse_attn_decode_interface(
     }
     if (model_type == ModelType::V32) {
         features.push_back(DecodeFeatures::V32_KVCACHE_FORMAT);
+    } else if (model_type == ModelType::V32_NO_ROPE) {
+        features.push_back(DecodeFeatures::V32_NO_ROPE_KVCACHE_FORMAT);
     } else if (model_type == ModelType::MODEL1) {
         features.push_back(DecodeFeatures::MODEL1_KVCACHE_FORMAT);
     } else {
@@ -364,7 +380,7 @@ sparse_attn_decode_interface(
         if (h_q == 64) {
             impl = new Decode_Sm100_Head64_Impl();
         } else if (h_q == 128) {
-            if (d_qk == 576) {
+            if (d_qk == 576 || model_type == ModelType::V32_NO_ROPE) {
                 impl = new Decode_Sm100_Head64x2_Impl();
             } else if (d_qk == 512) {
                 impl = new Decode_Sm100_Head128_Impl();

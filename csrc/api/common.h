@@ -90,6 +90,9 @@ inline int int64_stride_to_int(int64_t orig_stride) {
     if (MODEL_TYPE == ModelType::V32) { \
         static constexpr ModelType CONSTEXPR_NAME = ModelType::V32; \
         return __VA_ARGS__(); \
+    } else if (MODEL_TYPE == ModelType::V32_NO_ROPE) { \
+        static constexpr ModelType CONSTEXPR_NAME = ModelType::V32_NO_ROPE; \
+        return __VA_ARGS__(); \
     } else if (MODEL_TYPE == ModelType::MODEL1) { \
         static constexpr ModelType CONSTEXPR_NAME = ModelType::MODEL1; \
         return __VA_ARGS__(); \

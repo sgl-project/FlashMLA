@@ -4,7 +4,8 @@
 
 enum class ModelType {
     V32,
-    MODEL1
+    MODEL1,
+    V32_NO_ROPE,
 };
 
 struct __align__(4*8) DecodingSchedMeta {

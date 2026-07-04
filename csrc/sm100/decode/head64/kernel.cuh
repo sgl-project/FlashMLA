@@ -35,9 +35,9 @@ KernelTemplate<MODEL_TYPE>
     if (warp_idx == 0 && elect_one_sync()) {
         cute::prefetch_tma_descriptor(tma_params.tma_Q_SW128.get_tma_descriptor());
         cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
-        cute::prefetch_tma_descriptor(&tma_params.tensor_map_q_sw64);
+        cute::prefetch_tma_descriptor(&tma_params.tensor_map_q_sw64); // maybe default-initialized
         cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_nope);
-        cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_rope);
+        cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_rope); // maybe default-initialized
     }
 
     if (warp_idx == 0) {
@@ -46,7 +46,9 @@ KernelTemplate<MODEL_TYPE>
             plan.bar_q_tma.init(1);
             plan.bar_q_utccp.init(1);
             for (int i = 0; i < NUM_BUFS; ++i) {
-                plan.bar_rope_ready[i].init(1);
+                if constexpr (D_ROPE > 0) {
+                  plan.bar_rope_ready[i].init(1);
+                }
                 plan.bar_nope_ready[i].init(128); 
                 plan.bar_raw_ready[i].init(1);
                 plan.bar_raw_free[i].init(128);
@@ -538,7 +540,7 @@ KernelTemplate<MODEL_TYPE>
                             partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<D_ROPE/2>>{})
                         );
                         tQ_rope.data().get() = tmem_cols::Q_Tail;
-                        Tensor sK_rope = make_tensor(make_smem_ptr(plan.u.kv.dequant[rs.buf_idx].rope.data()), SmemLayoutKTiles_DualGemm_SW64<2/2>{});
+                        Tensor sK_rope = make_tensor(make_smem_ptr(plan.u.kv.dequant[rs.buf_idx].rope), SmemLayoutKTiles_DualGemm_SW64<2/2>{});
                         ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope, tP, true);
 
                         // QK NoPE
@@ -550,7 +552,17 @@ KernelTemplate<MODEL_TYPE>
                         tQ_nope.data().get() = tmem_cols::Q;
                         Tensor sK_nope = make_tensor(make_smem_ptr(plan.u.kv.dequant[rs.buf_idx].nope.data()), SmemLayoutKTiles_DualGemm_SW128<512/64/2>{});
                         ku::utcmma_ts(tiled_mma_P, tQ_nope, sK_nope, tP, false);
-                    } else {
+                    } else if constexpr (MODEL_TYPE == ModelType::V32_NO_ROPE) {
+                        // QK NoPE only
+                        plan.bar_nope_ready[rs.buf_idx].wait(rs.bar_phase);
+                        ku::tcgen05_after_thread_sync();
+                        Tensor tQ_nope = tiled_mma_P.get_slice(_0{}).make_fragment_A(
+                            partition_shape_A(tiled_mma_P, Shape<Int<B_H>, Int<D_NOPE/2>>{})
+                        );
+                        tQ_nope.data().get() = tmem_cols::Q;
+                        Tensor sK_nope = make_tensor(make_smem_ptr(plan.u.kv.dequant[rs.buf_idx].nope.data()), SmemLayoutKTiles_DualGemm_SW128<512/64/2>{});
+                        ku::utcmma_ts(tiled_mma_P, tQ_nope, sK_nope, tP, true);
+                    }else {
                         // MODEL1: RoPE is the last 64 dims within the full 512 dim, which couples with the last 64 dim from the NoPE part when performing dual GEMM. i.e.
                         // 
                         // logical view: |0|1|2|3|4|5|6|7| (where 7 is the RoPE part)
@@ -614,55 +626,61 @@ KernelTemplate<MODEL_TYPE>
                 }
             });
         } else if (warp_idx == 6 && elect_one_sync()) {
-            // KV RoPE retrieval warp
-            run_main_loop([&](const MainLoopArgs &args) {
-                plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
-                plan.bar_last_store_done.wait(args.bar_phase_batch_rel);
-                CUTE_NO_UNROLL
-                for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
-                    plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
-                    if constexpr (MODEL_TYPE == ModelType::V32) {
-                        plan.bar_qk_done[rs.buf_idx].wait(rs.bar_phase^1);
-                    } else {
-                        plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase^1);
-                    }
-                    int4 cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + 0);
-                    int4 nxt_cur_indices;
-                    CUTE_UNROLL
-                    for (int row = 0; row < B_TOPK; row += 4) {
-                        if (row+4 < B_TOPK)
-                            nxt_cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + row + 4);
-                        CUTE_UNROLL
-                        for (int t = 0; t < D_ROPE/(K_ROPE_SW/2); ++t) {
-                            ku::tma_gather4(
-                                block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv_rope : &tma_params.tensor_map_kv_rope,
-                                plan.bar_rope_ready[rs.buf_idx],
-                                plan.u.kv.dequant[rs.buf_idx].rope.data() + (K_ROPE_SW/2)*row + t*B_TOPK*(K_ROPE_SW/2),
-                                t*(K_ROPE_SW/2),
-                                cur_indices,
-                                (int64_t)TMA::CacheHintSm90::EVICT_LAST
-                            );
+            if constexpr (D_ROPE > 0) {
+                // KV RoPE retrieval warp
+                run_main_loop([&](const MainLoopArgs &args) {
+                    plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
+                    plan.bar_last_store_done.wait(args.bar_phase_batch_rel);
+                    CUTE_NO_UNROLL
+                    for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
+                        plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
+                        if constexpr (MODEL_TYPE == ModelType::V32) {
+                            plan.bar_qk_done[rs.buf_idx].wait(rs.bar_phase^1);
+                        } else { // MODEL1
+                            plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase^1);
                         }
-                        cur_indices = nxt_cur_indices;
+                        int4 cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + 0);
+                        int4 nxt_cur_indices;
+                        CUTE_UNROLL
+                        for (int row = 0; row < B_TOPK; row += 4) {
+                            if (row+4 < B_TOPK)
+                                nxt_cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + row + 4);
+                            CUTE_UNROLL
+                            for (int t = 0; t < D_ROPE/(K_ROPE_SW/2); ++t) {
+                                ku::tma_gather4(
+                                    block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv_rope : &tma_params.tensor_map_kv_rope,
+                                    plan.bar_rope_ready[rs.buf_idx],
+                                    (bf16*)plan.u.kv.dequant[rs.buf_idx].rope + (K_ROPE_SW/2)*row + t*B_TOPK*(K_ROPE_SW/2),
+                                    t*(K_ROPE_SW/2),
+                                    cur_indices,
+                                    (int64_t)TMA::CacheHintSm90::EVICT_LAST
+                                );
+                            }
+                            cur_indices = nxt_cur_indices;
+                        }
+                        plan.bar_rope_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*D_ROPE*sizeof(bf16));
+                        plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
+                        rs.update();
                     }
-                    plan.bar_rope_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*D_ROPE*sizeof(bf16));
-                    plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
-                    rs.update();
-                }
-            });
+                });
+            }
         } else if (warp_idx == 7) {
             // Indices transformation warp
             // Responsible for generating: TMA coordinates, scale factors, and valid masks
             static_assert(B_TOPK == 64);
-            static constexpr int tma_coords_step_per_token = MODEL_TYPE == ModelType::V32 ? 656/TMA_K_STRIDE : 576/TMA_K_STRIDE;
+            // tma_coords_step_per_token = 1
+            static constexpr int tma_coords_step_per_token =
+                MODEL_TYPE == ModelType::V32 ? 656 / TMA_K_STRIDE :
+                MODEL_TYPE == ModelType::V32_NO_ROPE ? 528 / TMA_K_STRIDE :
+                                                       576 / TMA_K_STRIDE;
             int tma_coords_step_per_block = params.stride_kv_block / TMA_K_STRIDE; // must < 2G since k_batch_stride < 1T and TMA_K_STRIDE > 512
             int tma_coords_step_per_extra_block = params.stride_extra_kv_block / TMA_K_STRIDE;
             uint8_t* k_scales_ptr =
-                MODEL_TYPE == ModelType::V32 ?
+                IS_V32_LIKE_MODEL ?
                 (uint8_t*)params.kv + D_NOPE :
                 (uint8_t*)params.kv + params.page_block_size*(D_NOPE+2*D_ROPE);
             uint8_t* extra_k_scales_ptr =
-                MODEL_TYPE == ModelType::V32 ?
+                IS_V32_LIKE_MODEL ?
                 (uint8_t*)params.extra_kv + D_NOPE :
                 (uint8_t*)params.extra_kv + params.extra_page_block_size*(D_NOPE+2*D_ROPE);
             
@@ -701,7 +719,7 @@ KernelTemplate<MODEL_TYPE>
                         bool is_token_valid = my_indices[i] != -1 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
                         valid_mask |= is_token_valid << i;
                         tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
-                        if constexpr (MODEL_TYPE == ModelType::V32) {
+                        if constexpr (IS_V32_LIKE_MODEL) {
                             int64_t offset = is_token_valid ? block_idx*cur_k_block_stride + idx_in_block*cur_k_row_stride : 0;
                             float4 cur_scale_fp32 = __ldg((float4*)(cur_k_scales_ptr + offset));
                             __nv_bfloat16 res[4];
@@ -720,7 +738,7 @@ KernelTemplate<MODEL_TYPE>
                     valid_mask <<= lane_idx%4*2;
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x2);
-                    if constexpr (MODEL_TYPE == ModelType::V32) {
+                    if constexpr (IS_V32_LIKE_MODEL) {
                         *(__int128_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(__int128_t*)scales;
                     } else {
                         *(__int128_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(__int128_t*)scales;
@@ -780,7 +798,7 @@ KernelTemplate<MODEL_TYPE>
                     return *(uint64_t*)(raw_nope_base + local_row_idx*NUM_GROUPS*D_NOPE + local_col_idx*(GROUP_SIZE*8));
                 };
                 // The following code suffers from a 2-way bank conflict when reading from SMEM.
-                if constexpr (MODEL_TYPE == ModelType::V32) {
+                if constexpr (IS_V32_LIKE_MODEL) {
                     CUTE_UNROLL
                     for (int local_row_idx = 0; local_row_idx < ROWS_PER_GROUP; ++local_row_idx) {
                         int row_idx = local_row_idx*NUM_GROUPS + group_idx;
@@ -864,6 +882,12 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
     if constexpr (MODEL_TYPE == ModelType::MODEL1) {
         constexpr int BYTES_PER_TOKEN = D_NOPE + 2*D_ROPE + 8;
         KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
+    } else if constexpr (MODEL_TYPE == ModelType::V32) {
+        constexpr int BYTES_PER_TOKEN = D_NOPE + 16 + 2 * D_ROPE;
+        KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in V32");  // Each block must be contiguous
+    } else { // ModelType::V32_NO_ROPE
+        constexpr int BYTES_PER_TOKEN = D_NOPE + 16;
+        KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in V32_NO_ROPE");  // Each block must be contiguous
     }
 
     auto shape_Q_SW128 = make_shape(B_H, D_Q, params.s_q, params.b);
@@ -918,15 +942,18 @@ void KernelTemplate<MODEL_TYPE>::run(const SparseAttnDecodeParams &params) {
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
         );  // NOTE We combine 8 float8 into 1 int64 since boxdim cannot > 256
-        CUtensorMap tensor_map_kv_rope = ku::make_tensor_map(
-            {D_ROPE, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
-            {TMA_K_STRIDE},
-            {K_ROPE_SW/2, 1},
-            (uint8_t*)k_ptr + (MODEL_TYPE == ModelType::V32 ? (D_NOPE+16) : D_NOPE),
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-            K_ROPE_SW == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
-        );
+        CUtensorMap tensor_map_kv_rope {};
+        if constexpr (D_ROPE > 0) {
+            tensor_map_kv_rope = ku::make_tensor_map(
+                {D_ROPE, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
+                {TMA_K_STRIDE},
+                {K_ROPE_SW/2, 1},
+                (uint8_t*)k_ptr + (MODEL_TYPE == ModelType::V32 ? (D_NOPE+16) : D_NOPE),
+                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                K_ROPE_SW == 64 ? CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B : CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+                CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
+            );
+        }
         return {tensor_map_kv_nope, tensor_map_kv_rope};
     };
 

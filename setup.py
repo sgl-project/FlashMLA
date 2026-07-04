@@ -79,6 +79,8 @@ ext_modules.append(
             "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
             "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
             "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
+            "csrc/sm90/decode/sparse_fp8/instantiations/v32_no_rope_persistent_h64.cu",
+            "csrc/sm90/decode/sparse_fp8/instantiations/v32_no_rope_persistent_h128.cu",
 
             # sm90 sparse prefill
             "csrc/sm90/prefill/sparse/fwd.cu",
@@ -100,6 +102,7 @@ ext_modules.append(
 
             # sm100 sparse decode
             "csrc/sm100/decode/head64/instantiations/v32.cu",
+            "csrc/sm100/decode/head64/instantiations/v32_no_rope.cu",
             "csrc/sm100/decode/head64/instantiations/model1.cu",
             "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
         ],
@@ -129,6 +132,8 @@ ext_modules.append(
             Path(this_dir) / "csrc" / "sm90",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+            # cuda 13 compatibility
+            Path(CUDA_HOME) / "include" / "cccl",
         ],
     )
 )

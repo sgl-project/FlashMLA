@@ -31,23 +31,34 @@ enum NamedBarriers : uint32_t {
 template<ModelType MODEL_TYPE>
 struct KernelTemplate {
 
+static constexpr bool IS_V32_LIKE_MODEL = MODEL_TYPE == ModelType::V32 || MODEL_TYPE == ModelType::V32_NO_ROPE;
 static constexpr int D_Q = MODEL_TYPE == ModelType::V32 ? 576 : 512;
 static constexpr int D_K = D_Q;
 static constexpr int D_V = 512;
-static constexpr int D_NOPE = MODEL_TYPE == ModelType::V32 ? 512 : 448;
-static constexpr int D_ROPE = 64;
-static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 128 : 64;
-static constexpr bool V_HAVE_ROPE = MODEL_TYPE == ModelType::V32 ? false : true;
-static constexpr int NUM_SCALES_EACH_TOKEN = MODEL_TYPE == ModelType::V32 ? 4 : 8;    // Padding is included
-using scale_t = std::conditional_t<MODEL_TYPE == ModelType::V32, bf16, e8m0>;
-static constexpr int TMA_K_STRIDE = MODEL_TYPE == ModelType::V32 ? D_NOPE+2*D_ROPE+4*(D_NOPE/QUANT_TILE_SIZE) : D_NOPE+2*D_ROPE;   // Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32 and 576 for MODEL1. Extra padding may be necessary for KV blocks.
-static_assert(D_NOPE + D_ROPE == D_Q);
+static constexpr int D_NOPE = IS_V32_LIKE_MODEL ? 512 : 448;
+static constexpr int D_ROPE = MODEL_TYPE == ModelType::V32_NO_ROPE ? 0: 64;;
+static constexpr int QUANT_TILE_SIZE = IS_V32_LIKE_MODEL ? 128 : 64;
+static constexpr bool V_HAVE_ROPE = IS_V32_LIKE_MODEL ? false : true;
+static constexpr bool QK_HAVE_ROPE = MODEL_TYPE == ModelType::V32_NO_ROPE ? false : true;
+static constexpr int NUM_SCALES_EACH_TOKEN = IS_V32_LIKE_MODEL ? 4 : 8;    // Padding is included
+using scale_t = std::conditional_t<IS_V32_LIKE_MODEL, bf16, e8m0>;
+// Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32 and 576 for MODEL1. Extra padding may be necessary for KV blocks.
+static constexpr int TMA_K_STRIDE = [] () {
+    if constexpr (MODEL_TYPE == ModelType::V32) {
+        return D_NOPE + 2 * D_ROPE + 4 * (D_NOPE / QUANT_TILE_SIZE);
+    } else if constexpr (MODEL_TYPE == ModelType::V32_NO_ROPE) {
+        return D_NOPE + 4 * (D_NOPE / QUANT_TILE_SIZE);
+    } else { // MODEL1
+        return D_NOPE + 2 * D_ROPE;
+    }
+}();
+static_assert(QK_HAVE_ROPE ? D_NOPE + D_ROPE == D_Q : D_NOPE == D_Q);
 static_assert(V_HAVE_ROPE ? (D_NOPE + D_ROPE == D_V) : (D_NOPE == D_V));
 
 static constexpr int B_H = 64;
 static constexpr int B_TOPK = 64;
 static constexpr int NUM_BUFS = 2;
-static constexpr int NUM_INDEX_BUFS = MODEL_TYPE == ModelType::V32 ? 2 : 4;    // Number of buffers for indices (tma_coords) & is_token_valid & scales
+static constexpr int NUM_INDEX_BUFS = IS_V32_LIKE_MODEL ? 2 : 4;    // Number of buffers for indices (tma_coords) & is_token_valid & scales
 static constexpr int NUM_THREADS = 128*3;  // 128 exp + 1/32 utcmma + 1/32 raw KV producer + 1/32 rope producer + 32 index+scale+valid_mask producer + 128 dequant
 static constexpr float MAX_INIT_VAL = -1e30f;  // To avoid (-inf) - (-inf) = NaN
 
@@ -171,7 +182,8 @@ struct SharedMemoryPlan {
         struct {
             struct {
                 array_aligned<bf16, B_H*D_NOPE> nope; // NoPE part, dequantized
-                array_aligned<bf16, B_H*D_ROPE> rope; // RoPE part, dequantized. SW64 in v32 mode, SW128 in MODEL1 mode
+                // NOTE: D_ROPE may be 0, so use array instead of array_aligned<bf16, 0> have size 16.
+                bf16 rope[B_H*D_ROPE]; // RoPE part, dequantized. SW64 in v32 mode, SW128 in MODEL1 mode
             } dequant[NUM_BUFS];
             static_assert(sizeof(dequant) >= sizeof(bf16) * (B_H*D_Q)); // So that Q does not covers raw_nope
             array_aligned<e4m3, B_H*D_NOPE> raw_nope[NUM_BUFS];  // Raw (quantized) NoPE part
