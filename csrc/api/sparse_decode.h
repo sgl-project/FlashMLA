@@ -300,7 +300,7 @@ sparse_attn_decode_interface(
             // V3.2 style
             bytes_per_token = bytes_per_token_v32;
         } else if (d_qk == 512 && d_v == 512) {
-            // V3.2_NO_ROPE orMODEL1 style
+            // V3.2_NO_ROPE or MODEL1 style
             TORCH_CHECK(kv.size(-1) == bytes_per_token_model1 || kv.size(-1) == bytes_per_token_v32_no_rope, "Unsupported kv head sizes for is_fp8_kvcache == True");
             bytes_per_token = kv.size(-1);
         } else {

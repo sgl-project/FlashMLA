@@ -36,13 +36,13 @@ static constexpr int D_Q = MODEL_TYPE == ModelType::V32 ? 576 : 512;
 static constexpr int D_K = D_Q;
 static constexpr int D_V = 512;
 static constexpr int D_NOPE = IS_V32_LIKE_MODEL ? 512 : 448;
-static constexpr int D_ROPE = MODEL_TYPE == ModelType::V32_NO_ROPE ? 0: 64;;
+static constexpr int D_ROPE = MODEL_TYPE == ModelType::V32_NO_ROPE ? 0 : 64;
 static constexpr int QUANT_TILE_SIZE = IS_V32_LIKE_MODEL ? 128 : 64;
 static constexpr bool V_HAVE_ROPE = IS_V32_LIKE_MODEL ? false : true;
 static constexpr bool QK_HAVE_ROPE = MODEL_TYPE == ModelType::V32_NO_ROPE ? false : true;
 static constexpr int NUM_SCALES_EACH_TOKEN = IS_V32_LIKE_MODEL ? 4 : 8;    // Padding is included
 using scale_t = std::conditional_t<IS_V32_LIKE_MODEL, bf16, e8m0>;
-// Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32 and 576 for MODEL1. Extra padding may be necessary for KV blocks.
+// Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32, 528 for V32_NO_ROPE, and 576 for MODEL1.
 static constexpr int TMA_K_STRIDE = [] () {
     if constexpr (MODEL_TYPE == ModelType::V32) {
         return D_NOPE + 2 * D_ROPE + 4 * (D_NOPE / QUANT_TILE_SIZE);

@@ -156,6 +156,10 @@ def main():
     torch.set_default_device(device)
     torch.cuda.set_device(device)
 
+    cap = torch.cuda.get_device_capability(device)
+    arch_name = {9: "SM90/H100", 10: "SM100/B200"}.get(cap[0], f"SM{cap[0]}{cap[1]}")
+    print(f"Compute capability: {cap} -> {arch_name} decode path")
+
     # (b, s_q, h_q, s_kv, topk, block_size, seed)
     S_KV = 128 * 1024
     TOPK = 2048

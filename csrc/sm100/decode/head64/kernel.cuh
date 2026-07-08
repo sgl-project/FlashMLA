@@ -562,7 +562,7 @@ KernelTemplate<MODEL_TYPE>
                         tQ_nope.data().get() = tmem_cols::Q;
                         Tensor sK_nope = make_tensor(make_smem_ptr(plan.u.kv.dequant[rs.buf_idx].nope.data()), SmemLayoutKTiles_DualGemm_SW128<512/64/2>{});
                         ku::utcmma_ts(tiled_mma_P, tQ_nope, sK_nope, tP, true);
-                    }else {
+                    } else {
                         // MODEL1: RoPE is the last 64 dims within the full 512 dim, which couples with the last 64 dim from the NoPE part when performing dual GEMM. i.e.
                         // 
                         // logical view: |0|1|2|3|4|5|6|7| (where 7 is the RoPE part)
@@ -663,6 +663,8 @@ KernelTemplate<MODEL_TYPE>
                         rs.update();
                     }
                 });
+            } else {
+                run_main_loop([&](const MainLoopArgs &args) {});
             }
         } else if (warp_idx == 7) {
             // Indices transformation warp
@@ -738,11 +740,7 @@ KernelTemplate<MODEL_TYPE>
                     valid_mask <<= lane_idx%4*2;
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x2);
-                    if constexpr (IS_V32_LIKE_MODEL) {
-                        *(__int128_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(__int128_t*)scales;
-                    } else {
-                        *(__int128_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(__int128_t*)scales;
-                    }
+                    *(__int128_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(__int128_t*)scales;
                     *(int2*)(plan.tma_coord[rs.index_buf_idx] + lane_idx*2) = *(int2*)tma_coords;
                     if (lane_idx%4 == 0)
                         plan.is_token_valid[rs.index_buf_idx][lane_idx/4] = valid_mask;
