@@ -13,6 +13,17 @@ produces from the same NoPE data. Reasoning:
 
 We force softmax_scale to 512**-0.5 for both runs so the only remaining source
 of any diff would be the kernel itself.
+
+Arch coverage note:
+  Dispatch is by GPU arch (see csrc/api/sparse_decode.h): sm100f / B200 ->
+  Decode_Sm100_Head64[_x2]_Impl, sm90a / H100 -> Decode_Sm90_Impl. These are two
+  distinct kernels and the V32-vs-V32_NO_ROPE bit-exactness must hold on both.
+  On an H100 only the sm90 path runs; the sm100 path -- including the V32_NO_ROPE
+  warp-6 everyone_sync barrier code in csrc/sm100/decode/head64/kernel.cuh -- is
+  only exercised on a B200. main() prints the detected compute capability so CI
+  logs show which path was actually covered; a green run on H100 alone does NOT
+  prove the B200/sm100 path runs. For full coverage, run this test on both H100
+  (sm90) and B200 (sm100).
 """
 
 import sys
