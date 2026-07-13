@@ -24,7 +24,8 @@ class ExtraTestParamForDecode:
     block_size: int = 64
     extra_block_size: Optional[int] = None
     have_extra_topk_length: bool = False
-    
+    is_v32_no_rope: bool = False    # When d_qk == 512, distinguish V32_NO_ROPE (packed fp8+fp32 scale, no RoPE) from MODEL1
+
 @dataclasses.dataclass
 class TestParam:
     s_q: int
@@ -46,7 +47,7 @@ class TestParam:
 class RawTestParamForDecode:
     """
     "Flattened" test parameters for decoding test
-    
+
     In our test script, to maintain compatibility with TestParam, we embed decode-only parameters into TestParam.decode, which is not very convinient when construct testcases. So here we have a "flattened" version of test parameters for decoding test.
     """
     b: int
@@ -67,6 +68,7 @@ class RawTestParamForDecode:
     have_extra_topk_length: bool = False
     d_qk: int = 576      # Q/K head dim (= dv + RoPE dim)
     d_v: int = 512     # V head dim
+    is_v32_no_rope: bool = False    # V32_NO_ROPE mode (only valid when d_qk == 512)
     check_correctness: bool = True
     num_runs: int = 10
     seed: int = -1
@@ -82,7 +84,8 @@ class RawTestParamForDecode:
             decode = ExtraTestParamForDecode(
                 self.b, self.is_varlen, self.have_zero_seqlen_k,
                 self.extra_s_k, self.extra_topk,
-                self.block_size, self.extra_block_size, self.have_extra_topk_length
+                self.block_size, self.extra_block_size, self.have_extra_topk_length,
+                self.is_v32_no_rope
             )
         )
     
@@ -184,8 +187,12 @@ class KVScope:
         if self.t.d_qk == 576:
             fp8_kvcache_layout = quant.FP8KVCacheLayout.V32_FP8Sparse
         elif self.t.d_qk == 512:
-            assert self.abs_indices is not None
-            fp8_kvcache_layout = quant.FP8KVCacheLayout.MODEL1_FP8Sparse
+            assert self.t.decode is not None
+            if self.t.decode.is_v32_no_rope:
+                fp8_kvcache_layout = quant.FP8KVCacheLayout.V32_NO_ROPE_FP8Sparse
+            else:
+                assert self.abs_indices is not None
+                fp8_kvcache_layout = quant.FP8KVCacheLayout.MODEL1_FP8Sparse
         else:
             assert False
         self.blocked_k_quantized = quant.quantize_k_cache(self.blocked_k, fp8_kvcache_layout)
@@ -390,7 +397,12 @@ def count_flop_and_mem_vol_for_decode(p: TestParam, t: TestcaseForDecode) -> Flo
     num_retrieved_tokens = get_num_retrieved_tokens(t.kv_scope) + (get_num_retrieved_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0)
 
     compute_flop = 2 * p.h_q * num_attended_tokens * (p.d_qk + p.d_v)
-    kv_token_size = 656 if p.d_qk == 576 else 576   # Assume FP8 KV Cache
+    if p.d_qk == 576:
+        kv_token_size = 656
+    elif p.decode.is_v32_no_rope:
+        kv_token_size = 528
+    else:
+        kv_token_size = 576
     mem_vol = sum([
         2 * b * p.s_q * p.h_q * p.d_qk, # Q
         num_retrieved_tokens * kv_token_size,   # K

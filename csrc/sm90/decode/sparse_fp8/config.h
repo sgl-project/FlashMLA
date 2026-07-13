@@ -22,11 +22,11 @@ static constexpr int CLUSTER_SIZE = NUM_M_BLOCKS;
 
 static constexpr int HEAD_DIM_K = MODEL_TYPE == ModelType::V32 ? 576 : 512;
 static constexpr int HEAD_DIM_V = 512;
-static constexpr int HEAD_DIM_ROPE = 64;
+static constexpr int HEAD_DIM_ROPE = MODEL_TYPE == ModelType::V32_NO_ROPE ? 0 : 64;
 static constexpr int HEAD_DIM_NOPE = HEAD_DIM_K - HEAD_DIM_ROPE;
 
-static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 128 : 64;
-static constexpr int NUM_SCALES = MODEL_TYPE == ModelType::V32 ? 4 : 8;  // For MODEL1: 7 fp8_e4m3 + 1 padding
+static constexpr int QUANT_TILE_SIZE = (MODEL_TYPE == ModelType::V32 || MODEL_TYPE == ModelType::V32_NO_ROPE) ? 128 : 64;
+static constexpr int NUM_SCALES = (MODEL_TYPE == ModelType::V32 || MODEL_TYPE == ModelType::V32_NO_ROPE) ? 4 : 8;  // For MODEL1: 7 fp8_e4m3 + 1 padding
 
 static constexpr int NUM_THREADS = 128*3;
 static constexpr int BLOCK_M = 64;

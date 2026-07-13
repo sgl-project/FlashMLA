@@ -87,6 +87,8 @@ template<ModelType MODEL_TYPE, int NUM_HEADS>
 template<typename TMAParams>
 __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
+    constexpr bool is_v32_like_model = (MODEL_TYPE == ModelType::V32 || MODEL_TYPE == ModelType::V32_NO_ROPE);
+
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
     const int s_q_idx = blockIdx.y;
     const int partition_idx = blockIdx.z;
@@ -164,7 +166,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
     auto get_cur_req_info = [&](int batch_idx) -> MainloopArgs {
         MainloopArgs args;
         int total_topk_padded;
-        if constexpr (MODEL_TYPE == ModelType::V32) {
+        if constexpr (is_v32_like_model) {
             total_topk_padded = params.topk;
         } else {
             int topk_length = params.topk_length ? __ldg(params.topk_length + batch_idx) : params.topk;
@@ -471,7 +473,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             int nxt_token_indexs[NUM_TOKENS_PER_THREAD];
             CUTE_UNROLL
             for (int round = 0; round < NUM_TOKENS_PER_THREAD; ++round) {
-                if (MODEL_TYPE == ModelType::V32 || args.start_block_idx < args.num_orig_kv_blocks)
+                if (is_v32_like_model || args.start_block_idx < args.num_orig_kv_blocks)
                     nxt_token_indexs[round] = __ldg(gIndices + args.start_block_idx*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + round*NUM_TOKENS_PER_ROUND + my_token_idx_base);
             }
 
@@ -516,7 +518,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     int token_index;
                     if constexpr (!IS_EXTRA_BLOCK) {
                         token_index = nxt_token_indexs[round];
-                        if (block_idx+1 != (MODEL_TYPE == ModelType::V32 ? args.end_block_idx : args.num_orig_kv_blocks))
+                        if (block_idx+1 != (is_v32_like_model ? args.end_block_idx : args.num_orig_kv_blocks))
                             nxt_token_indexs[round] = __ldg(gIndices + (block_idx+1)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx);
                     } else {
                         if constexpr (IS_FIRST_EXTRA_BLOCK) {
@@ -540,7 +542,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
                     fp8* gK_base;
                     bf16 scales[NUM_SCALES];
-                    if constexpr (MODEL_TYPE == ModelType::V32) {
+                    if constexpr (is_v32_like_model) {
                         static_assert(NUM_SCALES == 4);
                         gK_base = k_ptr + block_index*k_block_stride + rel_idx_in_block*k_row_stride;
                         float scales_float[NUM_SCALES];
@@ -582,7 +584,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                     CUTE_UNROLL
                     for (int dim_idx = 0; dim_idx < HEAD_DIM_NOPE/64; dim_idx += 1) {
                         fp8x16 cur_fp8x16 = load_128b_from_gmem<fp8x16, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(gK_nope + dim_idx*64);   // We use EVICT_LAST here since gK_base may not be aligned to 32B (for V3.2) and the performance is the best among all cache hints (for MODEL1)
-                        bf16 scale = scales[MODEL_TYPE == ModelType::V32 ? dim_idx/2 : dim_idx];
+                        bf16 scale = scales[is_v32_like_model ? dim_idx/2 : dim_idx];
                         auto dequant_and_save_bf16x8 = [&](const fp8x8 &data, int offset) {
                             int smem_offset = (dim_idx*64 + offset) * TOPK_BLOCK_SIZE;
                             bf16x8 cur_bf16x8 = cvt_fp8x8_bf16x8(data, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
@@ -596,6 +598,8 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         dequant_and_save_bf16x8(cur_fp8x16.lo, 0);
                         dequant_and_save_bf16x8(cur_fp8x16.hi, 8);
                     }
+
+                    if constexpr (MODEL_TYPE == ModelType::V32_NO_ROPE) continue;   // V3.2_NO_ROPE does not have RoPE, so we skip the following part
 
                     bf16* gK_rope;
                     if constexpr (MODEL_TYPE == ModelType::V32) {
@@ -628,7 +632,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 if (idx_in_warpgroup < 32) {
                     // We put this after fence_view_async_shared() since this won't be read by async proxy
                     auto is_index_valid = [&](int index, int offset_within_thread) -> bool {
-                        if constexpr (MODEL_TYPE == ModelType::V32) {
+                        if constexpr (is_v32_like_model) {
                             return index != -1;
                         } else {
                             return index != -1 && rel_block_idx*TOPK_BLOCK_SIZE + lane_idx*2 + offset_within_thread < topk_length;
@@ -646,7 +650,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 bar_phase_k ^= 1 << buf_idx;
             };
 
-            if constexpr (MODEL_TYPE == ModelType::V32) {
+            if constexpr (is_v32_like_model) {
                 CUTE_NO_UNROLL
                 for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
                     process_one_block(block_idx, IsOrigBlock{}, IsNotFirstExtraBlock{});
@@ -696,10 +700,14 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         if (params.extra_kv != nullptr) {
             KU_ASSERT(params.stride_extra_kv_row == BYTES_PER_TOKEN, "Each page block in extra KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
         }
-    } else {
+    } else if constexpr (MODEL_TYPE == ModelType::V32){
         KU_ASSERT(params.extra_kv == nullptr, "V3.2 does not support extra KV cache");
         KU_ASSERT(params.topk_length == nullptr, "V3.2 does not support dynamic topk length");
-        KU_ASSERT(params.stride_kv_row == 656);  // number of bytes per token (512 fp8 + 4 float32 + 64 bfloat16)
+        KU_ASSERT(params.stride_kv_row == 656);  // number of bytes per token (512 fp8 + 4 float32 + 64 bfloat16);
+    } else { // ModelType::V32_NO_ROPE
+        KU_ASSERT(params.extra_kv == nullptr, "V3.2_no_rope does not support extra KV cache");
+        KU_ASSERT(params.topk_length == nullptr, "V3.2_no_rope does not support dynamic topk length");
+        KU_ASSERT(params.stride_kv_row == 528);  // number of bytes per token (512 fp8 + 4 float32)
     }
 
     auto shape_Q = make_shape(params.h_q, params.d_qk, params.s_q, params.b);

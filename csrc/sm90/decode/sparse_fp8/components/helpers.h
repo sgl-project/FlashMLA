@@ -3,8 +3,6 @@
 #include <cooperative_groups.h>
 #include <cute/tensor.hpp>
 
-#include "config.h"
-
 using namespace cute;
 
 namespace sm90::decode::sparse_fp8 {

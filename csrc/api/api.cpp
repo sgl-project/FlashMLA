@@ -1,4 +1,6 @@
+#include <torch/extension.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #include "sparse_fwd.h"
 #include "sparse_decode.h"

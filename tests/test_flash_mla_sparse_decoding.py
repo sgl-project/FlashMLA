@@ -23,10 +23,16 @@ Generate testcase for unit test
 def gen_testcase() -> List[RawTestParam]:
     correctness_cases = []
     corner_cases = []
-    for d_qk in [576, 512]:
-        for have_extra_k in ([False, True] if d_qk == 512 else [False]):
+    # kv_cache_layouts: (d_qk, is_v32_no_rope)
+    #   (576, False) => V32 (packed fp8 + fp32 scale + bf16 rope, no extra kv, no topk_len)
+    #   (512, False) => MODEL1 (fp8+bf16 rope split, e8m0 scale, supports extra kv & topk_len)
+    #   (512, True)  => V32_NO_ROPE (packed fp8 + fp32 scale, no rope, no extra kv, no topk_len)
+    for d_qk, is_v32_no_rope in [(576, False), (512, False), (512, True)]:
+        # Only MODEL1 (d_qk == 512 and not is_v32_no_rope) supports extra kv / dynamic topk_length
+        supports_extra_and_topk_len = (d_qk == 512 and not is_v32_no_rope)
+        for have_extra_k in ([False, True] if supports_extra_and_topk_len else [False]):
             for have_extra_topk_len in ([False, True] if have_extra_k else [False]):
-                for have_topk_len in ([False, True] if d_qk == 512 else [False]):
+                for have_topk_len in ([False, True] if supports_extra_and_topk_len else [False]):
                     for h_q in [64, 128]:
                         cur_correctness_cases = [
                             RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,
@@ -38,6 +44,7 @@ def gen_testcase() -> List[RawTestParam]:
                                         extra_block_size=extra_block_size,
                                         have_extra_topk_length=have_extra_topk_len,
                                         d_qk=d_qk,
+                                        is_v32_no_rope=is_v32_no_rope,
                                         check_correctness=True,
                                         num_runs=0)
                             for (s_k, topk, block_size) in [
@@ -78,6 +85,7 @@ def gen_testcase() -> List[RawTestParam]:
                                         extra_block_size=extra_block_size,
                                         have_extra_topk_length=have_extra_topk_len,
                                         d_qk=d_qk,
+                                        is_v32_no_rope=is_v32_no_rope,
                                         check_correctness=True,
                                         num_runs=0,
                             )
@@ -102,6 +110,8 @@ def gen_testcase() -> List[RawTestParam]:
     base_and_bszs = [
         # V3.2
         (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576), [2, 64, 74, 128]),
+        # V3.2 NO ROPE
+        (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=512, is_v32_no_rope=True), [2, 64, 74, 128]),
         # MODEL1 CONFIG1
         (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64), [2, 64, 74, 128, 74*2, 256]),
         # MODEL1 CONFIG2
@@ -118,9 +128,9 @@ def gen_testcase() -> List[RawTestParam]:
         for b in bszs
     ] + [
         # Peak perf cases
-        RawTestParam(74*2, h_q, 2, 1, 32768, True, topk=16384, d_qk=d_qk)
+        RawTestParam(74*2, h_q, 2, 1, 32768, True, topk=16384, d_qk=d_qk, is_v32_no_rope=is_v32_no_rope)
         for h_q in [64, 128]
-        for d_qk in [512, 576]
+        for d_qk, is_v32_no_rope in [(512, False), (512, True), (576, False)]
     ]
 
     return correctness_cases + corner_cases + performance_cases
@@ -270,6 +280,7 @@ def main():
     table.add_column("sq")
     table.add_column("sk")
     table.add_column("d_qk")
+    table.add_column("KV Fmt")
     table.add_column("Feats")
     table.add_column("C/M")
     table.add_column("TFlops")
@@ -280,6 +291,12 @@ def main():
     for testcase, result in results:
         assert testcase.decode
         topk_str = f"{testcase.topk}" if testcase.decode.extra_topk is None else f"{testcase.topk}+{testcase.decode.extra_topk}"
+        if testcase.d_qk == 576:
+            kv_fmt_str = "V32"
+        elif testcase.decode.is_v32_no_rope:
+            kv_fmt_str = "V32_NO_ROPE"
+        else:
+            kv_fmt_str = "MODEL1"
         table.add_row(
             topk_str,
             str(testcase.decode.b),
@@ -287,6 +304,7 @@ def main():
             str(testcase.s_q),
             str(testcase.s_kv),
             str(testcase.d_qk),
+            kv_fmt_str,
             " V"[testcase.decode.is_varlen] + " L"[testcase.have_topk_length] + " E"[testcase.decode.have_extra_topk_length],
             f"{result.compute_memory_ratio:3.0f}",
             f"{result.achieved_tflops:3.0f}",
