@@ -164,6 +164,10 @@ static constexpr uint32_t NUM_WORKING_THREADS =
     );
 
 static constexpr uint32_t FOLD_FACTOR = 128 / H_Q_PER_CTA;
+// Asserted here rather than in the `else` of the `if constexpr (FOLD_FACTOR == 2)` / `if constexpr (H_Q_PER_CTA == 64)`
+// branches below: nvcc 13.0 evaluates static_asserts inside discarded if-constexpr branches
+static_assert(FOLD_FACTOR == 2 || FOLD_FACTOR == 4);
+static_assert(H_Q_PER_CTA == 32 || H_Q_PER_CTA == 64);
 static constexpr uint32_t NUM_MRGEMM_RAILS = 2; // The number of "rails" (batch size) during multi-rail GeMM. Currently must be 2
 static constexpr uint32_t NUM_P_ELEMS_PER_THREAD = H_Q_PER_CTA * B_TOPK / 128;
 

@@ -324,7 +324,6 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             if constexpr (FOLD_FACTOR == 2) {
                 li = smem.rowwise_li_buf[idx_in_warpgroup] + smem.rowwise_li_buf[idx_in_warpgroup^64];
             } else {
-                static_assert(FOLD_FACTOR == 4);
                 li = __fadd_rn(
                     __fadd_rn(smem.rowwise_li_buf[idx_in_warpgroup], smem.rowwise_li_buf[idx_in_warpgroup^64]),
                     __fadd_rn(smem.rowwise_li_buf[idx_in_warpgroup^32], smem.rowwise_li_buf[idx_in_warpgroup^96])
@@ -533,7 +532,6 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 if constexpr (H_Q_PER_CTA == 64) {
                     score_multiplier = smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup] + smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup^64];
                 } else {
-                    static_assert(H_Q_PER_CTA == 32);
                     score_multiplier = __fadd_rn(
                         __fadd_rn(smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup], smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup^64]),
                         __fadd_rn(smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup^32], smem.q_sqr_sum_buf[cur_job.job_idx_mod_2][idx_in_warpgroup^96])
