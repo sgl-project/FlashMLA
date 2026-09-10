@@ -1,13 +1,23 @@
 #pragma once
 
+#include <cctype>
 #include <span>
 
+// The pybind registration layer (the register_* functions in csrc/api/*.cpp) needs Python. A libtorch-only build --
+// sgl-kernel links this as a plain C++ library -- defines FLASH_MLA_LIBTORCH_ONLY and gets Python-free headers instead.
+#ifdef FLASH_MLA_LIBTORCH_ONLY
 #include <torch/all.h>
+#else
+#include <torch/extension.h>
+#include <pybind11/stl.h>
+#endif
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <kerutils/supplemental/torch_tensors.h>
 
 #include <cutlass/bfloat16.h>
+
+#include "kernels/kv_cache_format.h"
 
 static constexpr float LOG_2_E = 1.44269504f;
 
@@ -90,11 +100,11 @@ inline int int64_stride_to_int(int64_t orig_stride) {
     if (MODEL_TYPE == ModelType::V32) { \
         static constexpr ModelType CONSTEXPR_NAME = ModelType::V32; \
         return __VA_ARGS__(); \
+    } else if (MODEL_TYPE == ModelType::V4) { \
+        static constexpr ModelType CONSTEXPR_NAME = ModelType::V4; \
+        return __VA_ARGS__(); \
     } else if (MODEL_TYPE == ModelType::V32_NO_ROPE) { \
         static constexpr ModelType CONSTEXPR_NAME = ModelType::V32_NO_ROPE; \
-        return __VA_ARGS__(); \
-    } else if (MODEL_TYPE == ModelType::MODEL1) { \
-        static constexpr ModelType CONSTEXPR_NAME = ModelType::MODEL1; \
         return __VA_ARGS__(); \
     } else { \
         TORCH_CHECK(false, "Unsupported model type: ", (int)MODEL_TYPE); \
@@ -141,6 +151,46 @@ static constexpr std::string get_dynamic_enum_name(T value){
         };
     }(std::make_index_sequence<num>{});
     return (std::string)names[static_cast<std::size_t>(value)];
+}
+
+// =============================================
+// Paged quantized KV cache formats (decoding)
+// =============================================
+
+// A KV cache format named by the caller (the `kv_format` argument of sparse_decode_fwd), e.g. "V41" or "v32_no_rope"
+inline ModelType parse_kv_cache_format(const std::string &name) {
+    std::string upper;
+    for (char c : name) upper += (char)std::toupper((unsigned char)c);
+    for (ModelType mt : {ModelType::V32, ModelType::V4, ModelType::V41, ModelType::V41_FP4, ModelType::V32_NO_ROPE}) {
+        if (upper == get_dynamic_enum_name(mt)) {
+            return mt;
+        }
+    }
+    TORCH_CHECK(false, "Unknown kv_format: ", name, ". Expected one of V32, V32_NO_ROPE, V4, V41, V41_FP4");
+}
+
+// The format of a paged quantized KV cache with d_qk = 512 (V3.2-no-RoPE / V4 / V4.1 / V4.1 fp4), detected by
+// bytes_per_token (kv.size(3)). V3.2-no-RoPE and V4.1 are both 528 B per token, so `preferred` (from the caller's
+// explicit kv_format) breaks the tie; without it V3.2-no-RoPE wins, which is what callers written before V4.1 expect.
+inline ModelType detect_kv_cache_format_for_headdim_512(int bytes_per_token, std::optional<ModelType> preferred = std::nullopt) {
+    if (preferred.has_value() && bytes_per_token == kv_cache_bytes_per_token(*preferred)) {
+        return *preferred;
+    }
+    for (ModelType mt : {ModelType::V4, ModelType::V32_NO_ROPE, ModelType::V41, ModelType::V41_FP4}) {
+        if (bytes_per_token == kv_cache_bytes_per_token(mt)) {
+            return mt;
+        }
+    }
+    TORCH_CHECK(false, "Unsupported bytes_per_token for d_qk=512: ", bytes_per_token, ". Expected ",
+        kv_cache_bytes_per_token(ModelType::V4), " (V4), ", kv_cache_bytes_per_token(ModelType::V41), " (V4.1 or V3.2-no-RoPE) or ",
+        kv_cache_bytes_per_token(ModelType::V41_FP4), " (V4.1 fp4)");
+}
+
+// Dispatches the runtime (kv, extra_kv) format pair
+template<typename... Pairs, typename Fn>
+inline void dispatch_kv_formats(KVFormatPairs<Pairs...>, ModelType kv, ModelType extra_kv, Fn &&fn) {
+    bool matched = ((kv == Pairs::kv && extra_kv == Pairs::extra_kv ? (fn.template operator()<Pairs::kv, Pairs::extra_kv>(), true) : false) || ...);
+    TORCH_CHECK(matched, "Unsupported KV cache formats for this implementation: kv ", get_dynamic_enum_name(kv), ", extra_kv ", get_dynamic_enum_name(extra_kv));
 }
 
 // A shortcut macro to declare supported features in an implementation class.

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -10,9 +11,47 @@
 #include <cutlass/fast_math.h>
 
 #include "api/common.h"
-#include "api/dense_decode.h"
-#include "api/sparse_decode.h"
-#include "api/sparse_fwd.h"
+#include "kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
+
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+dense_attn_decode_interface(
+    at::Tensor &q,
+    const at::Tensor &kcache,
+    const int head_size_v,
+    const at::Tensor &seqlens_k,
+    const at::Tensor &block_table,
+    const float softmax_scale,
+    bool is_causal,
+    std::optional<at::Tensor> &tile_scheduler_metadata,
+    std::optional<at::Tensor> &num_splits
+);
+
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sparse_attn_decode_interface(
+    const at::Tensor &q,
+    const at::Tensor &kv,
+    const at::Tensor &indices,
+    const std::optional<at::Tensor> &topk_length,
+    const std::optional<at::Tensor> &attn_sink,
+    std::optional<at::Tensor> &tile_scheduler_metadata,
+    std::optional<at::Tensor> &num_splits,
+    const std::optional<at::Tensor> &extra_kv,
+    const std::optional<at::Tensor> &extra_indices,
+    const std::optional<at::Tensor> &extra_topk_length,
+    int d_v,
+    float sm_scale,
+    const std::optional<std::string> &kv_format
+);
+
+std::vector<at::Tensor> sparse_attn_prefill_interface(
+    const at::Tensor &q,
+    const at::Tensor &kv,
+    const at::Tensor &indices,
+    float sm_scale,
+    int d_v,
+    const std::optional<at::Tensor> &attn_sink,
+    const std::optional<at::Tensor> &topk_length
+);
 
 std::vector<at::Tensor> get_mla_decoding_metadata(
     at::Tensor& seqlens_k,
@@ -129,7 +168,8 @@ std::vector<at::Tensor> fwd_kvcache_mla(
             extra_indices_in_kvcache,
             extra_topk_length,
             head_size_v_int,
-            softmax_scale_float);
+            softmax_scale_float,
+            std::nullopt);
         return {std::get<0>(result), std::get<1>(result)};
     }
 

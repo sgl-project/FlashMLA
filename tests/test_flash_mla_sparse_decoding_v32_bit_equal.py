@@ -15,11 +15,11 @@ We force softmax_scale to 512**-0.5 for both runs so the only remaining source
 of any diff would be the kernel itself.
 
 Arch coverage note:
-  Dispatch is by GPU arch (see csrc/api/sparse_decode.h): sm100f / B200 ->
+  Dispatch is by GPU arch (see csrc/api/sparse_decode.cpp): sm100f / B200 ->
   Decode_Sm100_Head64[_x2]_Impl, sm90a / H100 -> Decode_Sm90_Impl. These are two
   distinct kernels and the V32-vs-V32_NO_ROPE bit-exactness must hold on both.
   On an H100 only the sm90 path runs; the sm100 path -- including the V32_NO_ROPE
-  warp-6 everyone_sync barrier code in csrc/sm100/decode/head64/kernel.cuh -- is
+  warp-6 everyone_sync barrier code in csrc/kernels/sm100/decode/sparse/head64/kernel.cuh -- is
   only exercised on a B200. main() prints the detected compute capability so CI
   logs show which path was actually covered; a green run on H100 alone does NOT
   prove the B200/sm100 path runs. For full coverage, run this test on both H100
@@ -51,12 +51,12 @@ def build_v32_kv(k_nope_bf16: torch.Tensor) -> torch.Tensor:
         device=k_nope_bf16.device,
     )
     k_full[..., :D_NOPE] = k_nope_bf16
-    return quant.quantize_k_cache(k_full, quant.FP8KVCacheLayout.V32_FP8Sparse)
+    return quant.quantize_k_cache(k_full, quant.KVCacheLayout.V32_FP8Sparse)
 
 
 def build_v32_no_rope_kv(k_nope_bf16: torch.Tensor) -> torch.Tensor:
     """[num_blocks, block_size, 1, 512] bf16 -> V32_NO_ROPE fp8 layout [., ., ., 528]."""
-    return quant.quantize_k_cache(k_nope_bf16, quant.FP8KVCacheLayout.V32_NO_ROPE_FP8Sparse)
+    return quant.quantize_k_cache(k_nope_bf16, quant.KVCacheLayout.V32_NO_ROPE_FP8Sparse)
 
 
 def assert_nope_scale_bytes_equal(kv_v32: torch.Tensor, kv_nr: torch.Tensor):
@@ -136,12 +136,14 @@ def run_one(b: int, s_q: int, h_q: int, s_kv: int, topk: int, block_size: int, s
         q_v32, kv_v32, None, None, D_V,
         sched_v32, None, sm_scale,
         causal=False, is_fp8_kvcache=True, indices=indices,
+        kv_format="V32",
     )
     sched_nr, _ = flash_mla.get_mla_metadata()
     out_nr, lse_nr = flash_mla.flash_mla_with_kvcache(
         q_nope, kv_nr, None, None, D_V,
         sched_nr, None, sm_scale,
         causal=False, is_fp8_kvcache=True, indices=indices,
+        kv_format="V32_NO_ROPE",
     )
 
     out_ok = _bit_equal(out_v32, out_nr)

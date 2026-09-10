@@ -66,7 +66,8 @@ def flash_mla_with_kvcache(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
-    extra_topk_length: Optional[torch.Tensor] = None
+    extra_topk_length: Optional[torch.Tensor] = None,
+    kv_format: Optional[str] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -88,6 +89,7 @@ def flash_mla_with_kvcache(
         attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
         extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
+        kv_format: Optional[str]. Names the layout of `k_cache`: "V32", "V32_NO_ROPE", "V4" or "V41". Only needed to tell V3.2-no-RoPE and V4.1 apart, since both are 528 Bytes per token with head_dim 512. When omitted the layout is detected from the shape and 528 Bytes per token means V3.2-no-RoPE, so callers written before V4.1 keep working; pass kv_format="V41" to select the V4.1 layout.
     
     For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
         head_dim should be 576 while head_dim_v should be 512.
@@ -96,6 +98,20 @@ def flash_mla_with_kvcache(
             - First 512 bytes: The "quantized NoPE" part, containing 512 float8_e4m3 values.
             - Next 16 bytes: Scale factors, containing 4 float32 values. The first float32 is the scale for the first 128 float8_e4m3 values, the second for the next 128, and so on.
             - Last 128 bytes: The "RoPE" part, containing 64 bfloat16 values. This part is not quantized for accuracy.
+
+    For DeepSeek V3.2 without RoPE ("V32_NO_ROPE"):
+        head_dim and head_dim_v should both be 512.
+        In FP8+sparse mode, each token's KV cache is 528 Bytes, structured as the first 528 Bytes of the V3.2 layout above:
+        512 float8_e4m3 NoPE values followed by 4 float32 scale factors, and no RoPE part.
+
+    For DeepSeek V4 and DeepSeek V4.1:
+        head_dim should be 512 while head_dim_v should be 512.
+        In FP8+sparse mode, the format is detected from the last dimension of `k_cache` (i.e. the bytes per token): 584 (V4), 528 (V4.1) or 288 (V4.1 with an fp4 extra cache).
+        In all three, a page block stores `page_block_size` data rows first and `page_block_size` scale rows afterwards, so the scale factors are not interleaved into the data rows:
+            - V4 (584 Bytes per token): the data row is 448 float8_e4m3 NoPE values followed by 64 bfloat16 RoPE values (not quantized); the scale row is 8 Bytes, of which the first 7 are float8_e8m0 scales (the 8th byte is padding), each covering 64 consecutive float8_e4m3 values of the NoPE part.
+            - V4.1 (528 Bytes per token): the data row is 512 float8_e4m3 values (the 64 RoPE dimensions are quantized as well, so there is no bfloat16 part); the scale row is 16 Bytes of float8_e8m0 scales, each covering 32 consecutive float8_e4m3 values.
+            - V4.1 fp4 (288 Bytes per token): only valid for `extra_k_cache`, and only when `k_cache` is in the V4.1 format; the data row is 256 Bytes containing 512 e2m1 values (2 values per byte, the even-indexed one in the low nibble), and the scale row is 32 Bytes of float8_e4m3 scales, each covering 16 consecutive e2m1 values.
+        See tests/quant.py for quantization and dequantization details.
 
     Return:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
@@ -156,7 +172,7 @@ def flash_mla_with_kvcache(
             q, k_cache, indices_in_kvcache, topk_length, attn_sink,
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
             extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
-            head_dim_v, softmax_scale
+            head_dim_v, softmax_scale, kv_format
         )
     else:
         # Dense attention

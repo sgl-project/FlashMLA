@@ -12,6 +12,7 @@ import kernelkit as kk
 import flash_mla
 
 import lib
+import quant
 from lib import TestParam
 from lib import RawTestParamForDecode as RawTestParam
 import ref
@@ -21,18 +22,14 @@ Generate testcase for unit test
 """
 
 def gen_testcase() -> List[RawTestParam]:
+    # The DeepSeek-V4.1 KV cache formats (V41 / V41_FP4) are only supported on SM100f
+    supports_v41 = torch.cuda.get_device_capability()[0] >= 10
     correctness_cases = []
     corner_cases = []
-    # kv_cache_layouts: (d_qk, is_v32_no_rope)
-    #   (576, False) => V32 (packed fp8 + fp32 scale + bf16 rope, no extra kv, no topk_len)
-    #   (512, False) => MODEL1 (fp8+bf16 rope split, e8m0 scale, supports extra kv & topk_len)
-    #   (512, True)  => V32_NO_ROPE (packed fp8 + fp32 scale, no rope, no extra kv, no topk_len)
-    for d_qk, is_v32_no_rope in [(576, False), (512, False), (512, True)]:
-        # Only MODEL1 (d_qk == 512 and not is_v32_no_rope) supports extra kv / dynamic topk_length
-        supports_extra_and_topk_len = (d_qk == 512 and not is_v32_no_rope)
-        for have_extra_k in ([False, True] if supports_extra_and_topk_len else [False]):
+    for d_qk in [576, 512]:
+        for have_extra_k in ([False, True] if d_qk == 512 else [False]):
             for have_extra_topk_len in ([False, True] if have_extra_k else [False]):
-                for have_topk_len in ([False, True] if supports_extra_and_topk_len else [False]):
+                for have_topk_len in ([False, True] if d_qk == 512 else [False]):
                     for h_q in [64, 128]:
                         cur_correctness_cases = [
                             RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,
@@ -44,7 +41,6 @@ def gen_testcase() -> List[RawTestParam]:
                                         extra_block_size=extra_block_size,
                                         have_extra_topk_length=have_extra_topk_len,
                                         d_qk=d_qk,
-                                        is_v32_no_rope=is_v32_no_rope,
                                         check_correctness=True,
                                         num_runs=0)
                             for (s_k, topk, block_size) in [
@@ -85,7 +81,6 @@ def gen_testcase() -> List[RawTestParam]:
                                         extra_block_size=extra_block_size,
                                         have_extra_topk_length=have_extra_topk_len,
                                         d_qk=d_qk,
-                                        is_v32_no_rope=is_v32_no_rope,
                                         check_correctness=True,
                                         num_runs=0,
                             )
@@ -107,20 +102,72 @@ def gen_testcase() -> List[RawTestParam]:
                         ]
                         corner_cases.extend(cur_corner_cases)
 
+    # DeepSeek-V4.1: fp8 (V41) KV cache, optionally with an fp4 (V41_FP4) extra KV cache
+    if supports_v41:
+        for extra_fp4 in [False, True]:
+            correctness_cases.extend([
+                RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,
+                             have_topk_length=have_topk_len,
+                             enable_attn_sink=True,
+                             extra_s_k=extra_s_k,
+                             extra_topk=extra_topk,
+                             block_size=block_size,
+                             extra_block_size=extra_block_size,
+                             have_extra_topk_length=have_extra_topk_len,
+                             d_qk=512,
+                             kvcache_layout=quant.KVCacheLayout.V41_FP8Sparse,
+                             extra_kvcache_layout=quant.KVCacheLayout.V41_FP4 if extra_fp4 else None,
+                             check_correctness=True,
+                             num_runs=0)
+                for h_q in [64, 128]
+                for have_extra_topk_len in [False, True]
+                for have_topk_len in [False]
+                for (s_k, topk, block_size) in [(512, 64, 64), (1024, 576, 61)]
+                for (extra_s_k, extra_topk, extra_block_size) in [(512, 64, 64), (650, 576, 53)]
+                for b in [4]
+                for s_q in [1, 3]
+                for is_varlen in [True]
+            ])
+
+    # DeepSeek-V3.2 without RoPE: like V3.2 (no extra KV cache, no dynamic topk length) but d_qk == 512
+    correctness_cases.extend([
+        RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,
+                     enable_attn_sink=True,
+                     block_size=block_size,
+                     d_qk=512,
+                     kvcache_layout=quant.KVCacheLayout.V32_NO_ROPE_FP8Sparse,
+                     check_correctness=True,
+                     num_runs=0)
+        for h_q in [64, 128]
+        for (s_k, topk, block_size) in [(512, 64, 64), (1024, 576, 61), (2046, 2048, 576)]
+        for b in [4, 74]
+        for s_q in [1, 3]
+        for is_varlen in [True, False]
+    ])
+
     base_and_bszs = [
         # V3.2
         (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576), [2, 64, 74, 128]),
-        # V3.2 NO ROPE
-        (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=512, is_v32_no_rope=True), [2, 64, 74, 128]),
-        # MODEL1 CONFIG1
+        # V3.2 without RoPE
+        (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=512,
+                      kvcache_layout=quant.KVCacheLayout.V32_NO_ROPE_FP8Sparse), [2, 64, 74, 128]),
+        # DeepSeek-V4 CONFIG1
         (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64), [2, 64, 74, 128, 74*2, 256]),
-        # MODEL1 CONFIG2
+        # DeepSeek-V4 CONFIG2
         (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=64), [2, 64, 74, 128, 74*2, 256]),
-        # MODEL1 CONFIG3
+        # DeepSeek-V4 CONFIG3
         (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=2, have_extra_topk_length=True), [2, 64, 74, 128, 74*2, 256]),
-        # MODEL1 CONFIG4
+        # DeepSeek-V4 CONFIG4
         (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=2, have_extra_topk_length=True), [2, 64, 74, 128, 74*2, 256]),
     ]
+    if supports_v41:
+        base_and_bszs += [
+            # DeepSeek-V4.1 CONFIG1 (fp8 V41 KV cache + fp4 V41_FP4 extra KV cache)
+            (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64,
+                          kvcache_layout=quant.KVCacheLayout.V41_FP8Sparse, extra_kvcache_layout=quant.KVCacheLayout.V41_FP4), [2, 64, 74, 128, 74*2, 256]),
+            (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64,
+                          kvcache_layout=quant.KVCacheLayout.V41_FP8Sparse, extra_kvcache_layout=quant.KVCacheLayout.V41_FP4), [2, 64, 74, 128, 74*2, 256])
+        ]
     performance_cases = [
         # Production cases
         dataclasses.replace(base, b=b)
@@ -128,9 +175,9 @@ def gen_testcase() -> List[RawTestParam]:
         for b in bszs
     ] + [
         # Peak perf cases
-        RawTestParam(74*2, h_q, 2, 1, 32768, True, topk=16384, d_qk=d_qk, is_v32_no_rope=is_v32_no_rope)
+        RawTestParam(74*2, h_q, 2, 1, 32768, True, topk=16384, d_qk=d_qk, kvcache_layout=kvcache_layout)
         for h_q in [64, 128]
-        for d_qk, is_v32_no_rope in [(512, False), (512, True), (576, False)]
+        for d_qk, kvcache_layout in [(512, None), (512, quant.KVCacheLayout.V32_NO_ROPE_FP8Sparse), (576, None)]
     ]
 
     return correctness_cases + corner_cases + performance_cases
@@ -291,12 +338,6 @@ def main():
     for testcase, result in results:
         assert testcase.decode
         topk_str = f"{testcase.topk}" if testcase.decode.extra_topk is None else f"{testcase.topk}+{testcase.decode.extra_topk}"
-        if testcase.d_qk == 576:
-            kv_fmt_str = "V32"
-        elif testcase.decode.is_v32_no_rope:
-            kv_fmt_str = "V32_NO_ROPE"
-        else:
-            kv_fmt_str = "MODEL1"
         table.add_row(
             topk_str,
             str(testcase.decode.b),
@@ -304,7 +345,7 @@ def main():
             str(testcase.s_q),
             str(testcase.s_kv),
             str(testcase.d_qk),
-            kv_fmt_str,
+            (testcase.decode.kvcache_layout.name if testcase.decode.kvcache_layout is not None else "-"),
             " V"[testcase.decode.is_varlen] + " L"[testcase.have_topk_length] + " E"[testcase.decode.have_extra_topk_length],
             f"{result.compute_memory_ratio:3.0f}",
             f"{result.achieved_tflops:3.0f}",
