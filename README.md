@@ -161,7 +161,7 @@ For DeepSeek V4 / V4.1 (`head_dim` = 512), the format is detected from the last 
 -   **V4.1**: 528 Bytes per token. The data row is 512 Bytes of `float8_e4m3`, i.e. the 64 RoPE dimensions are quantized as well and there is no `bfloat16` part. The scale row is 16 Bytes of `float8_e8m0`, each scale covering 32 consecutive `float8_e4m3` values.
 -   **V4.1 fp4**: 288 Bytes per token. The data row is 256 Bytes containing 512 `e2m1` values, 2 values per byte (the even-indexed one in the low nibble). The scale row is 32 Bytes of `float8_e4m3`, each scale covering 16 consecutive `e2m1` values. This format is only valid for `extra_k_cache`, and only when `k_cache` is in the V4.1 format; otherwise `extra_k_cache` must have the same format as `k_cache`. In pratice we expect the sliding window (SWA) kv cache to be in FP8 and the compress attention (CA) kv cache to be in FP4.
 
-V3.2-no-RoPE and V4.1 are both 528 Bytes per token with `head_dim` = 512, so the shape alone cannot tell them apart. Pass `kv_format` to `flash_mla_with_kvcache` (`"V32"`, `"V32_NO_ROPE"`, `"V4"`, `"V41"`) to name the layout explicitly; when it is omitted, 528 Bytes per token is read as V3.2-no-RoPE.
+V3.2-no-RoPE and V4.1 are both 528 Bytes per token with `head_dim` = 512, so the shape alone cannot tell them apart. Pass `kv_format` to `flash_mla_with_kvcache` (`"V32"`, `"V32_NO_ROPE"`, `"V4"`, `"V41"`) to name the layout explicitly; when it is omitted, 528 Bytes per token is read as V4.1 (the same as upstream FlashMLA), so a V3.2-no-RoPE cache must pass `kv_format="V32_NO_ROPE"`.
 
 See `tests/quant.py` for quantization and dequantization details.
 

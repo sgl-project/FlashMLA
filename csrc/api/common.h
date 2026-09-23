@@ -169,14 +169,15 @@ inline ModelType parse_kv_cache_format(const std::string &name) {
     TORCH_CHECK(false, "Unknown kv_format: ", name, ". Expected one of V32, V32_NO_ROPE, V4, V41, V41_FP4");
 }
 
-// The format of a paged quantized KV cache with d_qk = 512 (V3.2-no-RoPE / V4 / V4.1 / V4.1 fp4), detected by
-// bytes_per_token (kv.size(3)). V3.2-no-RoPE and V4.1 are both 528 B per token, so `preferred` (from the caller's
-// explicit kv_format) breaks the tie; without it V3.2-no-RoPE wins, which is what callers written before V4.1 expect.
+// The format of a paged quantized KV cache with d_qk = 512 (V4 / V4.1 / V4.1 fp4 / V3.2-no-RoPE), detected by
+// bytes_per_token (kv.size(3)). V4.1 and V3.2-no-RoPE are both 528 B per token, so `preferred` (from the caller's
+// explicit kv_format) breaks the tie; without it 528 B reads as V4.1, the same as upstream FlashMLA, and a
+// V3.2-no-RoPE cache must be named with kv_format="V32_NO_ROPE".
 inline ModelType detect_kv_cache_format_for_headdim_512(int bytes_per_token, std::optional<ModelType> preferred = std::nullopt) {
     if (preferred.has_value() && bytes_per_token == kv_cache_bytes_per_token(*preferred)) {
         return *preferred;
     }
-    for (ModelType mt : {ModelType::V4, ModelType::V32_NO_ROPE, ModelType::V41, ModelType::V41_FP4}) {
+    for (ModelType mt : {ModelType::V4, ModelType::V41, ModelType::V41_FP4, ModelType::V32_NO_ROPE}) {
         if (bytes_per_token == kv_cache_bytes_per_token(mt)) {
             return mt;
         }
