@@ -89,7 +89,7 @@ def flash_mla_with_kvcache(
         attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
         extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
-        kv_format: Optional[str]. Names the layout of `k_cache`: "V32", "V32_NO_ROPE", "V4" or "V41". Only needed to tell V3.2-no-RoPE and V4.1 apart, since both are 528 Bytes per token with head_dim 512. When omitted the layout is detected from the shape and 528 Bytes per token means V3.2-no-RoPE, so callers written before V4.1 keep working; pass kv_format="V41" to select the V4.1 layout.
+        kv_format: Optional[str]. Names the layout of `k_cache`: "V32", "V32_NO_ROPE", "V4" or "V41". Only needed to tell V3.2-no-RoPE and V4.1 apart, since both are 528 Bytes per token with head_dim 512. When omitted the layout is detected from the shape and 528 Bytes per token means V4.1, the same as upstream FlashMLA; pass kv_format="V32_NO_ROPE" to select the V3.2-no-RoPE layout.
     
     For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
         head_dim should be 576 while head_dim_v should be 512.

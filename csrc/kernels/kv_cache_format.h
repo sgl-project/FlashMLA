@@ -28,8 +28,8 @@ struct KVCacheFormat {
     // Bytes between two tokens in the data region of a page block: 656 / 528 / 576 / 512 / 256. The stride of the tensor maps of
     // the quantized part, so it must be >= 256 for the int32 TMA coordinates to cover a whole KV cache
     static constexpr int TMA_K_STRIDE = QUANT_BYTES + (IS_V32 ? NUM_SCALES_EACH_TOKEN * SCALE_BYTES : 0) + 2 * D_BF16;
-    // 656 (V3.2) / 528 (V3.2-no-RoPE) / 584 (V4) / 528 (V4.1) / 288 (V4.1 fp4). NOTE V3.2-no-RoPE and V4.1 collide, so
-    // detect_kv_cache_format_for_headdim_512 cannot tell them apart -- see the kv_format argument of sparse_decode_fwd
+    // 656 (V3.2) / 528 (V3.2-no-RoPE) / 584 (V4) / 528 (V4.1) / 288 (V4.1 fp4). NOTE V3.2-no-RoPE and V4.1 collide;
+    // detect_kv_cache_format_for_headdim_512 reads 528 as V4.1 unless the caller names the format (see its callers)
     static constexpr int BYTES_PER_TOKEN = TMA_K_STRIDE + (IS_V32 ? 0 : NUM_SCALES_EACH_TOKEN * SCALE_BYTES);
 };
 

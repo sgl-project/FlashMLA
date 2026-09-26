@@ -237,7 +237,7 @@ sparse_attn_decode_interface(
     float sm_scale,
     // Names the format of `kv` ("V32", "V32_NO_ROPE", "V4", "V41"). Only needed to disambiguate V3.2-no-RoPE from V4.1,
     // which have the same d_qk and bytes per token; when omitted the format is detected from the shape and 528 B per
-    // token means V3.2-no-RoPE, so pre-V4.1 callers keep working unchanged.
+    // token means V4.1, as in upstream FlashMLA.
     const std::optional<std::string> &kv_format
 ) {
     using bf16 = cutlass::bfloat16_t;
