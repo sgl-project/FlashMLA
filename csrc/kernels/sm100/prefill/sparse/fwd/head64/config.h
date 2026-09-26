@@ -10,7 +10,7 @@ namespace sm100::prefill::sparse_fwd::head64 {
 
 using namespace cute;
 
-template<SparseAttnFwdMode FWD_MODE, int D_QK>
+template<SparseAttnFwdMode FWD_MODE, int D_QK, bool PACKED = false>
 struct KernelTemplate {
 
 static constexpr uint32_t B_H = 64;   // Head block size. This kernel only supports h_q == B_H
@@ -40,7 +40,12 @@ static constexpr bool HAVE_ROPE = D_ROPE > 0;
 static constexpr int B_TOPK = 64;
 static constexpr int NUM_BUFS = 3;
 static constexpr int NUM_THREADS = 128 + 128 + 128;
-static constexpr int NUM_WORKER_THREADS = 128 + 128 + 1 + B_TOPK/8+1 + (HAVE_ROPE?64:0);
+// Packed mode assigns the two otherwise idle RoPE warps to KV loading,
+// mask-warp lanes 0-15 to membership, and lane 16 to CLC. Keeping CLC
+// outside the MMA warp lets matrix issue progress independently of scheduling.
+static constexpr int KV_WARPS = PACKED ? 6 : 4;
+static constexpr int NUM_WORKER_THREADS = 128 + KV_WARPS*32 + 1 + (PACKED ? 16 : B_TOPK/8) + 1 + (HAVE_ROPE?64:0);
+static_assert(!PACKED || (D_QK == 512 && FWD_MODE == SparseAttnFwdMode::Prefill));
 
 static constexpr int B_EPI = 64;
 static constexpr int B_EPI_SB = 256;    // "SB" means SuperBlock
@@ -63,6 +68,10 @@ using SmemLayoutQNoPE = decltype(coalesce(tile_to_shape(
     Shape<Int<B_H>, Int<D_V>>{},
     Step<_1, _2>{}
 ), Shape<_1, _1>{}));
+
+using PackedQShape = Shape<_16, _512, _4>;
+using PackedQSmem = decltype(composition(SmemLayoutQNoPE{},
+    Layout<PackedQShape, Stride<_1, _64, _16>>{}));
 
 using SmemLayoutQRoPE = decltype(coalesce(tile_to_shape(
     UMMA::Layout_K_SW64_Atom<bf16>{},
@@ -126,7 +135,7 @@ struct SharedMemoryPlan {
     bf16 qk_rope_slot[B_TOPK*(D_Q-D_V)];
     float p_exchange_buf[4][32 * (B_TOPK/(128/B_H))];
     bf16 s[B_H*B_TOPK];
-    char is_k_valid[NUM_BUFS][B_TOPK/8];
+    alignas(16) char is_k_valid[NUM_BUFS][PACKED ? B_H*(B_TOPK/8) : B_TOPK/8];
     transac_bar_t bar_prologue_q_nope, bar_prologue_q_rope, bar_prologue_utccp_nope, bar_prologue_utccp_rope;
     transac_bar_t bar_qk_nope_done[NUM_BUFS], bar_qk_rope_done;    // Pi = QKi^T (the nope part) done
     transac_bar_t bar_sv_done[NUM_BUFS];    // O += SiVi done (i.e. O, Si and Vi are free)
