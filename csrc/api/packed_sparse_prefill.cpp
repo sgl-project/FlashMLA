@@ -14,8 +14,8 @@ packed_sparse_attn_prefill_interface(const at::Tensor &q, const at::Tensor &kv,
     TORCH_CHECK(q.is_cuda(), "q must be CUDA");
     at::cuda::CUDAGuard guard(q.device());
     const Arch arch;
-    TORCH_CHECK(arch.major == 10 && arch.minor == 0 && arch.num_sms == 148,
-                "Packed BF16 sparse prefill is qualified on 148-SM B200 only");
+    TORCH_CHECK(arch.major == 10 && (arch.minor == 0 || arch.minor == 3) && arch.num_sms == 148,
+                "Packed BF16 sparse prefill is qualified on 148-SM B200 and B300 GPUs");
     TORCH_CHECK(q.dim() == 3 && q.size(1) == 16 && q.size(2) == 512,
                 "q must have shape [tokens, 16, 512]");
     TORCH_CHECK(kv.dim() == 3 && kv.size(1) == 1 && kv.size(2) == 512,

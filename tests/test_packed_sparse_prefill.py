@@ -7,12 +7,15 @@ from flash_mla.packed_sparse_prefill import flash_mla_packed_sparse_fwd
 
 
 @pytest.fixture(autouse=True)
-def require_b200():
+def require_supported_blackwell():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     prop = torch.cuda.get_device_properties(0)
-    if (prop.major, prop.minor, prop.multi_processor_count) != (10, 0, 148):
-        pytest.skip("Packing is qualified on 148-SM B200 only")
+    if (prop.major, prop.minor, prop.multi_processor_count) not in (
+        (10, 0, 148),
+        (10, 3, 148),
+    ):
+        pytest.skip("Packing is qualified on 148-SM B200 and B300 GPUs")
 
 
 def inputs(rows, width, padded=True):
@@ -47,7 +50,14 @@ def assert_reference(result, q, kv, indices, lengths, scale, sink):
     assert torch.isfinite(out).all()
     # Includes both halves of a packed tile and the final partial tile.
     samples = sorted(
-        {0, min(1, rows - 1), min(2, rows - 1), min(3, rows - 1), rows // 2, rows - 1}
+        {
+            0,
+            min(1, rows - 1),
+            min(2, rows - 1),
+            min(3, rows - 1),
+            rows // 2,
+            rows - 1,
+        }
     )
     for row in samples:
         idx = indices[row, : int(lengths[row])].long()

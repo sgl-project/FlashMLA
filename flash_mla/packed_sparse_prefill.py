@@ -13,7 +13,7 @@ def flash_mla_packed_sparse_fwd(
     sm_scale: float,
     attn_sink: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """BF16 sparse prefill for 16 real heads on a 148-SM B200.
+    """BF16 sparse prefill for 16 real heads on 148-SM B200 and B300 GPUs.
 
     q is [tokens, 16, 512], including strided views of padded Q; kv is
     [history, 1, 512]. indices is contiguous int32 [tokens, 128 or 640],
