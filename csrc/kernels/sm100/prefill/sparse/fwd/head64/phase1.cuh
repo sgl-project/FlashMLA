@@ -70,10 +70,10 @@ KV5                 scale(O) w.r.t P3
 
 using FwdMode = SparseAttnFwdMode;
 
-template<FwdMode FWD_MODE, int D_QK>
+template<FwdMode FWD_MODE, int D_QK, bool PACKED>
 template<typename TmaParam>
 __device__ void
-KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params, const TmaParam &tma_params) {
+KernelTemplate<FWD_MODE, D_QK, PACKED>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params, const TmaParam &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     // Grid shape: [s_q, 1, 1]
 
@@ -111,7 +111,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
             plan.bar_sv_done[i].init(1);
             plan.bar_kv_nope_ready[i][0].init(1);
             plan.bar_kv_nope_ready[i][1].init(1);
-            plan.bar_k_valid_ready[i].init(B_TOPK/8);
+            plan.bar_k_valid_ready[i].init(PACKED ? 16 : B_TOPK/8);
             plan.bar_k_valid_free[i].init(128);
         }
         plan.bar_p_free.init(128);
@@ -121,7 +121,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
             plan.bar_kv_rope_ready.init(64);
         }
         plan.bar_o_write_back_done.init(128);
-        plan.bar_o_write_back_done_waited.init(4);
+        plan.bar_o_write_back_done_waited.init(KV_WARPS);
         fence_barrier_init();
     } else if (warp_idx == 2) {
         // Initialize TMEM
@@ -177,9 +177,15 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
     };
 
     auto issue_q_nope_tma = [&](int s_q_idx, int qko_slot_idx) {
+        if constexpr (PACKED) {
+            auto gQ_nope = local_tile(tma_params.tma_Q_nope.get_tma_tensor(tma_params.shape_Q_nope), PackedQShape{}, make_coord(0, 0, s_q_idx));
+            auto sQ_nope = make_tensor(make_smem_ptr(plan.u.qko_slots[qko_slot_idx].data()), PackedQSmem{});
+            ku::launch_tma_copy(tma_params.tma_Q_nope, gQ_nope, sQ_nope, plan.bar_prologue_q_nope, TMA::CacheHintSm90::EVICT_FIRST);
+        } else {
         Tensor gQ_nope = tma_params.tma_Q_nope.get_tma_tensor(tma_params.shape_Q_nope)(_, _, s_q_idx);
         Tensor sQ_nope = make_tensor(make_smem_ptr(plan.u.qko_slots[qko_slot_idx].data()), SmemLayoutQNoPE{});
         ku::launch_tma_copy(tma_params.tma_Q_nope, gQ_nope, sQ_nope, plan.bar_prologue_q_nope, TMA::CacheHintSm90::EVICT_FIRST);
+        }
     };
 
     auto issue_q_nope_utccp = [&](bool outer_loop_phase, int qko_slot_idx) {
@@ -275,7 +281,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                     false  // Prefill keeps P in registers (no store_back_p)
                 >(
                     tmem_cols::P,
-                    plan.is_k_valid[buf_idx],
+                    plan.is_k_valid[buf_idx] + (PACKED ? ((warp_idx&1)*32 + lane_idx)*(B_TOPK/8) : 0),
                     warp_idx, lane_idx, 
                     [&]() {plan.bar_p_free.arrive();},
                     plan.p_exchange_buf,
@@ -284,8 +290,16 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                 plan.bar_k_valid_free[buf_idx].arrive();
                 
                 // Get rowwise max of Pi
+                // Multiplying masked -inf by zero produces NaN. Preserve the mask.
+                const bool zero_scale = PACKED && params.sm_scale_div_log2 == 0.0f;
+                const float effective_scale = zero_scale ? 1.0f : params.sm_scale_div_log2;
+                if (zero_scale) {
+                    CUTE_UNROLL
+                    for (int i = 0; i < NUM_ELEMS_PER_THREAD; ++i)
+                        p[i] = p[i] == -CUDART_INF_F ? -CUDART_INF_F : 0.0f;
+                }
                 float cur_pi_max = get_max<NUM_ELEMS_PER_THREAD>(p);
-                cur_pi_max *= params.sm_scale_div_log2;
+                cur_pi_max *= effective_scale;
     
                 plan.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
                 NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
@@ -310,7 +324,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
     
                 // Calculate S
                 nv_bfloat162 s[NUM_ELEMS_PER_THREAD/2];
-                float cur_sum = get_s_from_p<NUM_ELEMS_PER_THREAD>(s, p, params.sm_scale_div_log2, new_max);
+                float cur_sum = get_s_from_p<NUM_ELEMS_PER_THREAD>(s, p, effective_scale, new_max);
                 li = fma(li, scale_for_old, cur_sum);
     
                 // Wait for last SV gemm, write S
@@ -368,8 +382,8 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
     
             // Store O
             float attn_sink = (params.attn_sink == nullptr || idx_in_warpgroup%B_H >= params.h_q)
-                ? -CUDART_INF_F : __ldg(params.attn_sink + (idx_in_warpgroup%B_H))*CUDART_L2E_F;
-            float output_scale = __fdividef(1.0f, li + exp2f(attn_sink - mi));
+                ? -CUDART_INF_F : __ldg(params.attn_sink + (idx_in_warpgroup % (PACKED ? 16 : B_H)))*CUDART_L2E_F;
+            float output_scale = (PACKED && li == 0.0f) ? 0.0f : __fdividef(1.0f, li + exp2f(attn_sink - mi));
             Tensor sO = make_tensor(make_smem_ptr(plan.u.qko_slots[o_slot_idx].data()), SmemLayoutO{});
             Tensor tma_gO = flat_divide(
                 tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, args.s_q_idx),
@@ -454,10 +468,13 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
         if (warp_idx == 3) {
             cute::TMEM::Allocator1Sm().free(0, 512);
         }
-    } else if (warpgroup_idx == 1) {
+    } else if (warpgroup_idx == 1 || (PACKED && warp_idx >= 10)) {
         // Producer warp for KV
         int warp_idx = cutlass::canonical_warp_idx_sync() - 4;
-        constexpr int NUM_WARPS = 4, NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/4)/NUM_WARPS;
+        if constexpr (PACKED) if (warp_idx >= 6) warp_idx -= 2;
+        constexpr int NUM_WARPS = KV_WARPS;
+        constexpr int NUM_LOCAL_ROWS_PER_WARP = (B_TOPK/4 + NUM_WARPS-1)/NUM_WARPS;
+        const int local_rows = (B_TOPK/4 - warp_idx + NUM_WARPS-1)/NUM_WARPS;
         run_outer_loop([&](const OuterloopArgs &args) {
             if (elect_one_sync()) {
                 int* gIndices = params.indices + args.s_q_idx*params.stride_indices_s_q; // [topk]
@@ -467,7 +484,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                     int max_indices = -1, min_indices = params.s_kv;
                     CUTE_UNROLL
                     for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
-                        indices[local_row] = __ldg((int4*)(gIndices + k*B_TOPK) + local_row*NUM_WARPS + warp_idx);
+                        indices[local_row] = make_int4(-1, -1, -1, -1);
+                        if (local_row*NUM_WARPS + warp_idx < B_TOPK/4)
+                            indices[local_row] = __ldg((int4*)(gIndices + k*B_TOPK) + local_row*NUM_WARPS + warp_idx);
                         max_indices = max(max_indices, int4_max(indices[local_row]));
                         min_indices = min(min_indices, int4_min(indices[local_row]));
                     }
@@ -490,6 +509,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                     auto load_kv_nope_part = [&](int part_idx) {
                         CUTE_UNROLL
                         for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                            if (local_row*NUM_WARPS + warp_idx >= B_TOPK/4) continue;
                             CUTE_UNROLL
                             for (int local_col = part_idx*(D_V/2/64); local_col < (part_idx+1)*(D_V/2/64); ++local_col) {
                                 ku::tma_gather4(
@@ -511,7 +531,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                         // NOTE See head128/phase1.cuh for this TMA skipping technique
                         CUTE_UNROLL
                         for (int part_idx = 0; part_idx < 2; ++part_idx)
-                            plan.bar_kv_nope_ready[buf_idx][part_idx].complete_transaction(NUM_LOCAL_ROWS_PER_WARP*4*D_V/2*sizeof(bf16));
+                            plan.bar_kv_nope_ready[buf_idx][part_idx].complete_transaction(local_rows*4*D_V/2*sizeof(bf16));
                     }
 
                     rs.update();
@@ -617,9 +637,40 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                 }
                 rs = rs.offset_by(-1);
             });
+        } else if (PACKED && warp_idx == 9 && lane_idx == 16) {
+            run_outer_loop([&](const OuterloopArgs &args) {
+                plan.bar_clc_empty.wait(args.outer_loop_phase^1);
+                ku::issue_clc_query(plan.bar_clc_full, plan.clc_response_obj);
+                plan.bar_clc_full.arrive_and_expect_tx(sizeof(plan.clc_response_obj));
+            });
         } else if (warp_idx == 9) {
-            // KV valid loading + CLC producer warp
-            if (lane_idx < B_TOPK/8) {
+            // Packed membership uses lanes 0-15; lane 16 schedules the next tile.
+            if constexpr (PACKED) {
+                if (lane_idx < 16) run_outer_loop([&](const OuterloopArgs &args) {
+                    int* gIndices = params.indices + args.s_q_idx*params.stride_indices_s_q;
+                    const uint64_t* masks = params.packed_mask + (int64_t)args.s_q_idx*(params.topk/64)*4;
+                    CUTE_NO_UNROLL
+                    for (int k = 0; k < args.num_k_blocks; ++k) {
+                        char my_mask = 0;
+                        if (lane_idx < B_TOPK/8)
+                            my_mask = load_indices_and_generate_mask(lane_idx, gIndices + k*B_TOPK, params.s_kv, k*B_TOPK, args.topk_length);
+                        uint64_t key_mask = 0;
+                        CUTE_UNROLL
+                        for (int i = 0; i < B_TOPK/8; ++i)
+                            key_mask |= (uint64_t)(uint8_t)__shfl_sync(0xffff, my_mask, i) << (8*i);
+                        uint64_t membership = __ldg(masks + k*4 + lane_idx/4) & key_mask;
+                        auto [buf_idx, bar_phase] = rs.get<NUM_BUFS>();
+                        plan.bar_k_valid_free[buf_idx].wait(bar_phase^1);
+                        auto packed_membership = make_uint4(
+                            (uint32_t)membership, (uint32_t)(membership >> 32),
+                            (uint32_t)membership, (uint32_t)(membership >> 32));
+                        *reinterpret_cast<uint4*>(plan.is_k_valid[buf_idx] + lane_idx*32) = packed_membership;
+                        *reinterpret_cast<uint4*>(plan.is_k_valid[buf_idx] + lane_idx*32 + 16) = packed_membership;
+                        plan.bar_k_valid_ready[buf_idx].arrive();
+                        rs.update();
+                    }
+                });
+            } else if (lane_idx < B_TOPK/8) {
                 run_outer_loop([&](const OuterloopArgs &args) {
                     int* gIndices = params.indices + args.s_q_idx*params.stride_indices_s_q; // [topk]
                     CUTE_NO_UNROLL
@@ -699,8 +750,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
     Kernel::sparse_attn_fwd_kernel_devfunc(params, tma_params);
 }
 
-template<FwdMode FWD_MODE, int D_QK>
-void KernelTemplate<FWD_MODE, D_QK>::run(const SparseAttnFwdParams& params) {
+template<FwdMode FWD_MODE, int D_QK, bool PACKED>
+void KernelTemplate<FWD_MODE, D_QK, PACKED>::run(const SparseAttnFwdParams& params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
     KU_ASSERT(params.topk >= 128);  // To simplify synchronizations between outer loop boundries
@@ -708,17 +759,29 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const SparseAttnFwdParams& params) {
     KU_ASSERT(params.d_qk == D_QK);
     static_assert(D_QK == 576 || D_QK == 512);
 
-    auto shape_Q_nope = make_shape(params.h_q, D_V, params.s_q);
+    KU_ASSERT(PACKED == (params.packed_mask != nullptr));
+    auto shape_Q_nope = [&]() {
+        if constexpr (PACKED) return make_shape(_16{}, D_V, params.packed_q_rows);
+        else return make_shape(params.h_q, D_V, params.s_q);
+    }();
+    auto stride_Q_nope = [&]() {
+        if constexpr (PACKED) return make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q/4);
+        else return make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q);
+    }();
+    auto smem_Q_nope = []() {
+        if constexpr (PACKED) return PackedQSmem{};
+        else return SmemLayoutQNoPE{};
+    }();
     auto tma_Q_nope = cute::make_tma_copy(
         SM90_TMA_LOAD{},
         make_tensor(
             make_gmem_ptr((bf16*)params.q),
             make_layout(
                 shape_Q_nope,
-                make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
+                stride_Q_nope
             )
         ),
-        SmemLayoutQNoPE{}
+        smem_Q_nope
     );
 
     auto shape_Q_rope = make_shape(params.h_q, D_Q-D_V == 0 ? 64 : D_Q-D_V, params.s_q);    // If 
@@ -780,7 +843,7 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const SparseAttnFwdParams& params) {
         shape_O, tma_O,
         tensor_map_kv_nope
     };
-    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<FWD_MODE, D_QK>, decltype(tma_params)>;
+    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<FWD_MODE, D_QK, PACKED>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -789,10 +852,9 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const SparseAttnFwdParams& params) {
     KU_CHECK_KERNEL_LAUNCH();
 }
 
-template<FwdMode FWD_MODE, int D_QK>
+template<FwdMode FWD_MODE, int D_QK, bool PACKED>
 void run_sparse_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-    KernelTemplate<FWD_MODE, D_QK>::run(params);
+    KernelTemplate<FWD_MODE, D_QK, PACKED>::run(params);
 }
 
 }
-
