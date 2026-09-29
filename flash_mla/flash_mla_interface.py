@@ -189,6 +189,43 @@ def flash_mla_with_kvcache(
     return (out, lse)
 
 
+def flash_mla_with_kvcache_nvfp4(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_global_scale: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    tile_scheduler_metadata: Optional[torch.Tensor] = None,
+    num_splits: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """SM100/SM103 sparse GLM-5.2 decode, with a 416-byte uint8 KV row.
+
+    A row contains 256 bytes of packed E2M1 NoPE, 32 E4M3 block-16 scales,
+    then 64 BF16 RoPE values (128 bytes). The persistent FP32 global scale
+    is a device tensor, so it may be shared across CUDA graph replays.
+    Returned scheduler metadata and split counts may be reused on later calls
+    with the same batch/query shapes and TopK. Prefill is not implemented here.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    if q.dtype != torch.bfloat16 or q.ndim != 4 or q.shape[2:] != (64, 576):
+        raise ValueError("GLM52_NVFP4 requires BF16 Q [B, Sq, 64, 576]")
+    if k_cache.dtype != torch.uint8 or k_cache.ndim != 4 or k_cache.shape[1:] != (64, 1, 416):
+        raise ValueError("GLM52_NVFP4 requires uint8 KV [pages, 64, 1, 416]")
+    if indices.dtype != torch.int32 or indices.shape != (q.shape[0], q.shape[1], 2048):
+        raise ValueError("GLM52_NVFP4 requires int32 indices [B, Sq, 2048]")
+    if kv_global_scale.dtype != torch.float32 or kv_global_scale.numel() != 1:
+        raise ValueError("GLM52_NVFP4 requires a single FP32 global scale")
+    return flash_mla_cuda.sparse_decode_fwd(
+        q, k_cache, indices, topk_length, attn_sink,
+        tile_scheduler_metadata, num_splits,
+        None, None, None, 512, softmax_scale, "GLM52_NVFP4", kv_global_scale,
+    )
+
+
 def flash_mla_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,

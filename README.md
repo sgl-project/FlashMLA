@@ -95,6 +95,7 @@ Support matrix:
 | :---: | :---: | :---: | :---: |
 | Dense Decoding | SM90 | MQA | DeepSeek V3 / V3.1 |
 | Sparse Decoding | SM90 & SM100 | MQA | DeepSeek V3.2 / V4 / V4.1 [2] |
+| GLM-5.2 Sparse Decoding | SM100 / SM103 | MQA, H64 | NVFP4 NoPE + BF16 RoPE [3] |
 | Dense Prefill | SM100 | MHA | DeepSeek V3 / V3.1 / V3.2 |
 | Sparse Prefill | SM90 & SM100 | MQA | DeepSeek V3.2 / V4 / V4.1 |
 | Fused Norm RoPE Attn RoPE Cast | SM100 | MQA | DeepSeek V4 / V4.1 |
@@ -102,6 +103,8 @@ Support matrix:
 [1]: Here "MLA Mode" refers to the mode used for MLA calculation. MQA stands for Multi-Query Attention mode (i.e. `head_dim_k` = 576 (for DeepSeek V3/V3.1/V3.2) or 512 (for DeepSeek V4/V4.1) with `head_dim_v` = 512), while MHA stands for Multi-Head Attention mode (i.e. `head_dim_k` = 192 / 128 with `head_dim_v` = 128). For a detailed explanation of these modes, please refer to the appendix of [DeepSeek V3.2's Paper](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp).
 
 [2] Sparse Decoding for DeepSeek V4.1 is only available on SM100
+
+[3] Dedicated 416-byte cache format and `flash_mla_with_kvcache_nvfp4` API, described below. This is not the V4.1 FP4 extra-cache format.
 
 ## Installation
 
@@ -164,6 +167,18 @@ For DeepSeek V4 / V4.1 (`head_dim` = 512), the format is detected from the last 
 V3.2-no-RoPE and V4.1 are both 528 Bytes per token with `head_dim` = 512, so the shape alone cannot tell them apart. Pass `kv_format` to `flash_mla_with_kvcache` (`"V32"`, `"V32_NO_ROPE"`, `"V4"`, `"V41"`) to name the layout explicitly; when it is omitted, 528 Bytes per token is read as V3.2-no-RoPE.
 
 See `tests/quant.py` for quantization and dequantization details.
+
+**GLM-5.2 NVFP4 sparse decoding (SM100/SM103, H64):**
+
+`flash_mla_with_kvcache_nvfp4(q, k_cache, kv_global_scale, indices, ...)`
+accepts BF16 Q `[B, Sq, 64, 576]`, int32 Top-K indices `[B, Sq, 2048]`,
+and a contiguous uint8 cache `[pages, 64, 1, 416]`. Each token row stores
+256 packed E2M1 NoPE bytes, 32 E4M3 block-16 scales, then 64 BF16 RoPE
+values (128 bytes). `kv_global_scale` is a one-element device FP32 tensor,
+kept alive across CUDA Graph replays. The result contains output, LSE, and
+reusable scheduler metadata/split counts. This is a **different ABI** from
+V4.1 FP4 (288 bytes and no separate BF16 RoPE). Sparse prefill is not covered;
+callers must provide BF16 KV to the existing prefill API.
 
 **Sparse Attention (`indices` tensor):**
 The `indices` tensor (if provided) enables token-level sparse attention by instructing the kernel to compute attention only for specified tokens.

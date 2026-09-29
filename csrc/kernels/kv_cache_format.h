@@ -13,29 +13,32 @@ template<ModelType MT>
 struct KVCacheFormat {
     static constexpr ModelType MODEL_TYPE = MT;
     static constexpr bool IS_V32 = MT == ModelType::V32 || MT == ModelType::V32_NO_ROPE;   // fp32 scales inside the token data
-    static constexpr bool IS_FP4 = MT == ModelType::V41_FP4;
-    static constexpr int D_QK = MT == ModelType::V32 ? 576 : 512;
+    static constexpr bool IS_GLM52_NVFP4 = MT == ModelType::GLM52_NVFP4;
+    static constexpr bool IS_FP4 = MT == ModelType::V41_FP4 || IS_GLM52_NVFP4;
+    static constexpr int D_QK = (MT == ModelType::V32 || IS_GLM52_NVFP4) ? 576 : 512;
     static constexpr int D_ROPE = MT == ModelType::V32_NO_ROPE ? 0 : 64;
     static constexpr int D_NOPE = D_QK - D_ROPE;
-    static constexpr int D_FP4 = IS_FP4 ? D_QK : 0;                                     // Dimensions stored as fp4 e2m1
+    static constexpr int D_FP4 = IS_GLM52_NVFP4 ? D_NOPE : (IS_FP4 ? D_QK : 0);                                  // Dimensions stored as fp4 e2m1
     static constexpr int D_FP8 = IS_FP4 ? 0 : (MT == ModelType::V41 ? D_QK : D_NOPE);   // Dimensions stored as fp8 e4m3, needing dequant (V3.2-no-RoPE: D_NOPE == D_QK)
     static constexpr int D_BF16 = D_QK - D_FP4 - D_FP8;                                 // Dimensions stored as bf16 (the RoPE part of V3.2 / V4), not needing dequant
     static constexpr int QUANT_TILE_SIZE = IS_FP4 ? 16 : (MT == ModelType::V41 ? 32 : (MT == ModelType::V4 ? 64 : 128));   // Dimensions sharing one scale
-    static constexpr int NUM_SCALES_EACH_TOKEN = (IS_V32 ? D_NOPE : D_QK) / QUANT_TILE_SIZE;   // 4 / 4 / 8 (7 + 1 byte of padding) / 16 / 32
+    static constexpr int NUM_SCALES_EACH_TOKEN = (IS_V32 || IS_GLM52_NVFP4 ? D_NOPE : D_QK) / QUANT_TILE_SIZE;   // 4 / 4 / 8 (7 + 1 byte of padding) / 16 / 32
     static constexpr int SCALE_BYTES = IS_V32 ? 4 : 1;                                  // fp32 (V3.2), ue8m0 (V4 / V4.1) or e4m3 (fp4)
     static constexpr int SCALE_SMEM_BYTES = IS_V32 ? 2 : 1;                             // Bytes per scale in shared memory: bf16 (V3.2), ue8m0 or e4m3
     static constexpr int QUANT_BYTES = D_FP4 / 2 + D_FP8;                               // The quantized (fp4 / fp8) data of a token
     // Bytes between two tokens in the data region of a page block: 656 / 528 / 576 / 512 / 256. The stride of the tensor maps of
     // the quantized part, so it must be >= 256 for the int32 TMA coordinates to cover a whole KV cache
-    static constexpr int TMA_K_STRIDE = QUANT_BYTES + (IS_V32 ? NUM_SCALES_EACH_TOKEN * SCALE_BYTES : 0) + 2 * D_BF16;
+    static constexpr int INLINE_SCALE_BYTES = IS_GLM52_NVFP4 ? NUM_SCALES_EACH_TOKEN : (IS_V32 ? NUM_SCALES_EACH_TOKEN * SCALE_BYTES : 0);
+    static constexpr int TMA_K_STRIDE = QUANT_BYTES + INLINE_SCALE_BYTES + 2 * D_BF16;
     // 656 (V3.2) / 528 (V3.2-no-RoPE) / 584 (V4) / 528 (V4.1) / 288 (V4.1 fp4). NOTE V3.2-no-RoPE and V4.1 collide, so
     // detect_kv_cache_format_for_headdim_512 cannot tell them apart -- see the kv_format argument of sparse_decode_fwd
-    static constexpr int BYTES_PER_TOKEN = TMA_K_STRIDE + (IS_V32 ? 0 : NUM_SCALES_EACH_TOKEN * SCALE_BYTES);
+    static constexpr int BYTES_PER_TOKEN = TMA_K_STRIDE + (INLINE_SCALE_BYTES ? 0 : NUM_SCALES_EACH_TOKEN * SCALE_BYTES);
 };
 
 // Runtime counterpart of KVCacheFormat<MT>::BYTES_PER_TOKEN
 constexpr int kv_cache_bytes_per_token(ModelType mt) {
     switch (mt) {
+        case ModelType::GLM52_NVFP4: return KVCacheFormat<ModelType::GLM52_NVFP4>::BYTES_PER_TOKEN;
         case ModelType::V32: return KVCacheFormat<ModelType::V32>::BYTES_PER_TOKEN;
         case ModelType::V4: return KVCacheFormat<ModelType::V4>::BYTES_PER_TOKEN;
         case ModelType::V41: return KVCacheFormat<ModelType::V41>::BYTES_PER_TOKEN;

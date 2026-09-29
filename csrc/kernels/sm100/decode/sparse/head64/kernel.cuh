@@ -509,8 +509,8 @@ KernelTemplate<CONFIG>
                 // Mainloop
                 CUTE_NO_UNROLL
                 for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
-                    if constexpr (OrigKVFormat::MODEL_TYPE == ModelType::V32) {
-                        // V3.2: RoPE behaves like an extra block with size 64, so we can do RoPE first
+                    if constexpr (OrigKVFormat::MODEL_TYPE == ModelType::V32 || OrigKVFormat::IS_GLM52_NVFP4) {
+                        // V3.2/GLM-5.2: RoPE behaves like an extra block with size 64, so we can do RoPE first
                         // QK RoPE
                         plan.bar_bf16_part_load_ready[rs.buf_idx].wait(rs.bar_phase);
                         ku::tcgen05_after_thread_sync();
@@ -604,7 +604,7 @@ KernelTemplate<CONFIG>
                     CUTE_NO_UNROLL
                     for (int block_idx = args.start_block_idx; block_idx < args.end_block_idx; ++block_idx) {
                         plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
-                        if constexpr (OrigKVFormat::MODEL_TYPE == ModelType::V32) {
+                        if constexpr (OrigKVFormat::MODEL_TYPE == ModelType::V32 || OrigKVFormat::IS_GLM52_NVFP4) {
                             plan.bar_qk_done[rs.buf_idx].wait(rs.bar_phase^1);
                         } else {
                             plan.bar_sv_done[rs.buf_idx].wait(rs.bar_phase^1);
@@ -670,6 +670,7 @@ KernelTemplate<CONFIG>
                     static constexpr bool IS_EXTRA_BLOCK = std::is_same_v<decltype(is_extra_block_t), IsExtraBlock>;
                     using F = std::conditional_t<IS_EXTRA_BLOCK, ExtraKVFormat, OrigKVFormat>;
                     int cur_block_size = IS_EXTRA_BLOCK ? params.extra_page_block_size : params.page_block_size;
+                    int cur_num_blocks = IS_EXTRA_BLOCK ? params.extra_num_blocks : params.num_blocks;
                     int64_t cur_k_block_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_block : params.stride_kv_block;
                     [[maybe_unused]] int cur_k_row_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_row : params.stride_kv_row;
                     uint8_t* cur_k_scales_ptr = IS_EXTRA_BLOCK ? extra_k_scales_ptr : k_scales_ptr;
@@ -684,12 +685,18 @@ KernelTemplate<CONFIG>
                     CUTE_UNROLL
                     for (int i = 0; i < 2; ++i) {
                         int cur_idx = i == 0 ? my_indices.x : my_indices.y;
-                        int kv_block_idx = (unsigned int)cur_idx / cur_block_size;
-                        int idx_in_block = (unsigned int)cur_idx % cur_block_size;
+                        bool is_token_valid = cur_idx >= 0 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
+                        if constexpr (F::IS_GLM52_NVFP4) {
+                            is_token_valid &= cur_idx < cur_num_blocks * cur_block_size;
+                        }
+                        int safe_idx = is_token_valid ? cur_idx : 0;
+                        int kv_block_idx = (unsigned int)safe_idx / cur_block_size;
+                        int idx_in_block = (unsigned int)safe_idx % cur_block_size;
                         block_idx_arr[i] = kv_block_idx;
                         idx_in_block_arr[i] = idx_in_block;
-                        bool is_token_valid = cur_idx != -1 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
-                        if constexpr (F::IS_V32) {
+                        if constexpr (F::IS_GLM52_NVFP4) {
+                            // Inline E4M3 scales are gathered together with the packed KV row.
+                        } else if constexpr (F::IS_V32) {
                             int64_t offset = is_token_valid ? kv_block_idx*cur_k_block_stride + idx_in_block*cur_k_row_stride : 0;
                             float4 cur_scale_fp32 = __ldg((float4*)(cur_k_scales_ptr + offset));
                             // bf16, not ue8m0: rounding these fp32 scales to a power of two costs too much accuracy
@@ -713,14 +720,19 @@ KernelTemplate<CONFIG>
                     CUTE_UNROLL
                     for (int i = 0; i < 2; ++i) {
                         int cur_idx = i == 0 ? my_indices.x : my_indices.y;
-                        bool is_token_valid = cur_idx != -1 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
+                        bool is_token_valid = cur_idx >= 0 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
+                        if constexpr (F::IS_GLM52_NVFP4) {
+                            is_token_valid &= cur_idx < cur_num_blocks * cur_block_size;
+                        }
                         valid_mask |= is_token_valid << i;
                         tma_coords[i] = is_token_valid ? block_idx_arr[i]*cur_tma_coords_step_per_block + idx_in_block_arr[i]*tma_coords_step_per_token : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
                     }
                     valid_mask <<= lane_idx%4*2;
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x2);
-                    if constexpr (SCALE_SMEM_STRIDE == F::NUM_SCALES_EACH_TOKEN * F::SCALE_SMEM_BYTES) {
+                    if constexpr (F::IS_GLM52_NVFP4) {
+                        // Scales already arrived through the packed-row TMA gather.
+                    } else if constexpr (SCALE_SMEM_STRIDE == F::NUM_SCALES_EACH_TOKEN * F::SCALE_SMEM_BYTES) {
                         // The lane's 2 tokens are contiguous in smem: one store
                         copy_bytes<2*SCALE_SMEM_STRIDE>(plan.scales[rs.index_buf_idx][lane_idx*2], scales[0]);
                     } else {
@@ -788,7 +800,11 @@ KernelTemplate<CONFIG>
                     rs.buf_idx == 0 ? raw_0 : raw_1,
                     plan.scales[rs.index_buf_idx][0],
                     rs.buf_idx == 0 ? dst_0 : dst_1,
-                    []{}
+                    []{},
+                    [&]() -> float {
+                        if constexpr (F::IS_GLM52_NVFP4) return __ldg(params.kv_global_scale);
+                        else return 1.f;
+                    }()
                 );
                 cutlass::arch::fence_view_async_shared();
                 plan.bar_quant_part_dequant_ready[rs.buf_idx].arrive();
@@ -863,7 +879,7 @@ void KernelTemplate<CONFIG>::run(const SparseAttnDecodeParams &params) {
         );
     }
 
-    CUtensorMap tensor_map_kv_quant_part = make_kv_quant_part_tensor_map<OrigKVFormat, OrigKVFormat::QUANT_BYTES, RAW_TOKEN_SMEM_STRIDE<OrigKVFormat>>(
+    CUtensorMap tensor_map_kv_quant_part = make_kv_quant_part_tensor_map<OrigKVFormat, OrigKVFormat::QUANT_BYTES + (OrigKVFormat::IS_GLM52_NVFP4 ? OrigKVFormat::INLINE_SCALE_BYTES : 0), RAW_TOKEN_SMEM_STRIDE<OrigKVFormat>>(
         "k_cache", params.kv, params.num_blocks, params.stride_kv_block, params.stride_kv_row, 0);
     CUtensorMap tensor_map_kv_bf16_part{};
     if constexpr (D_BF16 > 0) {
@@ -871,7 +887,7 @@ void KernelTemplate<CONFIG>::run(const SparseAttnDecodeParams &params) {
     }
     CUtensorMap tensor_map_extra_kv_quant_part{}, tensor_map_extra_kv_bf16_part{};
     if (params.extra_topk > 0) {
-        tensor_map_extra_kv_quant_part = make_kv_quant_part_tensor_map<ExtraKVFormat, ExtraKVFormat::QUANT_BYTES, RAW_TOKEN_SMEM_STRIDE<ExtraKVFormat>>(
+        tensor_map_extra_kv_quant_part = make_kv_quant_part_tensor_map<ExtraKVFormat, ExtraKVFormat::QUANT_BYTES + (ExtraKVFormat::IS_GLM52_NVFP4 ? ExtraKVFormat::INLINE_SCALE_BYTES : 0), RAW_TOKEN_SMEM_STRIDE<ExtraKVFormat>>(
             "extra_k_cache", params.extra_kv, params.extra_num_blocks, params.stride_extra_kv_block, params.stride_extra_kv_row, 0);
         if constexpr (ExtraKVFormat::D_BF16 > 0) {
             tensor_map_extra_kv_bf16_part = make_kv_bf16_part_tensor_map<ExtraKVFormat, K_ROPE_SW/2, K_ROPE_SW>(params.extra_kv, params.extra_num_blocks, params.stride_extra_kv_block);

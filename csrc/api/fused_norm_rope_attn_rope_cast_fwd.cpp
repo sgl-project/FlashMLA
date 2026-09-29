@@ -339,6 +339,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
         sm_scale, sm_scale * LOG_2_E,
         num_blocks, page_block_size, topk,
         model_type, extra_model_type,
+        nullptr, // kv_global_scale: this API does not support GLM52_NVFP4
 
         (bf16*)q.data_ptr(),
         (bf16*)kv.data_ptr(),

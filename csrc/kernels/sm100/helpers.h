@@ -125,6 +125,34 @@ void fp4x8_to_bf16x2x4(uint32_t packed, ku::nvbf16x2 *out) {
 #endif
 }
 
+// GLM-5.2's persistent scale is applied in FP16 before rounding the packed FP4
+// values to BF16. Keep this distinct from the V4.1 FP4 path (no global scale).
+CUTE_DEVICE
+void glm52_fp4x8_to_bf16x2x4(uint32_t packed, __half2 scale, ku::nvbf16x2 *out) {
+    uint32_t converted[4];
+    asm("{ .reg .b8 b0, b1, b2, b3;"
+        " mov.b32 {b0, b1, b2, b3}, %4;"
+        " cvt.rn.f16x2.e2m1x2 %0, b0;"
+        " cvt.rn.f16x2.e2m1x2 %1, b1;"
+        " cvt.rn.f16x2.e2m1x2 %2, b2;"
+        " cvt.rn.f16x2.e2m1x2 %3, b3; }"
+        : "=r"(converted[0]), "=r"(converted[1]), "=r"(converted[2]), "=r"(converted[3])
+        : "r"(packed));
+    CUTE_UNROLL
+    for (int i = 0; i < 4; ++i) {
+        const __half2 scaled = __hmul2(*reinterpret_cast<const __half2*>(&converted[i]), scale);
+        out[i] = __float22bfloat162_rn(__half22float2(scaled));
+    }
+}
+
+CUTE_DEVICE
+__half glm52_scale_to_half(uint8_t code) {
+    const uint16_t packed = uint16_t(code) | (uint16_t(code) << 8);
+    uint32_t converted;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(converted) : "h"(packed));
+    return *reinterpret_cast<const __half*>(&converted);
+}
+
 // 4x fp8_e4m3 -> 2x bf16x2 without scaling, used for the e4m3 scales of the fp4 KV cache
 CUTE_DEVICE
 void fp8x4_to_bf16x2x2(uint32_t packed, ku::nvbf16x2 *out) {

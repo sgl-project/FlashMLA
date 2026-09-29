@@ -7,7 +7,8 @@ enum class ModelType {
     V4,         // DeepSeek V4 (d_qk=512)
     V41,        // DeepSeek V4.1 (d_qk=512, RoPE fp8, quant tile size 32)
     V41_FP4,    // DeepSeek V4.1 (d_qk=512, fp4 e2m1, quant tile size 16, e4m3 scales)
-    V32_NO_ROPE // DeepSeek V3.2 without RoPE (d_qk=512, V3.2's inline fp32 scales)
+    V32_NO_ROPE, // DeepSeek V3.2 without RoPE (d_qk=512, V3.2's inline fp32 scales)
+    GLM52_NVFP4 // GLM-5.2 (d_qk=576: 256 B E2M1 + 32 B E4M3 scales + 128 B BF16 RoPE)
 };
 
 struct __align__(4*8) DecodingSchedMeta {
@@ -71,6 +72,7 @@ struct SparseAttnDecodeParams {
     int num_blocks, page_block_size, topk;
     ModelType model_type;           // Format of `kv`, see KVCacheFormat in kv_cache_format.h
     ModelType extra_model_type;     // Format of `extra_kv`: model_type, or V41_FP4 next to a V41 `kv` (see is_valid_kv_format_pair)
+    float* __restrict__ kv_global_scale; // GLM52_NVFP4 only: persistent device FP32 scalar
 
     cutlass::bfloat16_t* __restrict__ q;   // [b, s_q, h_q, d_qk]
     cutlass::bfloat16_t* __restrict__ kv;  // [num_blocks, page_block_size, d_qk]

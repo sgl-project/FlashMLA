@@ -30,6 +30,7 @@ enum class DecodeFeatures : int {
     V4_KVCACHE_FORMAT,
     V41_KVCACHE_FORMAT,
     V41_FP4_KVCACHE_FORMAT,
+    GLM52_NVFP4_KVCACHE_FORMAT,
 
     ATTN_SINK,
     TOPK_LENGTH,
@@ -96,13 +97,15 @@ class Decode_Sm100_Head64_Impl : public DecodeImplBase {
         DecodeFeatures::V4_KVCACHE_FORMAT,
         DecodeFeatures::V41_KVCACHE_FORMAT,
         DecodeFeatures::V41_FP4_KVCACHE_FORMAT,
+        DecodeFeatures::GLM52_NVFP4_KVCACHE_FORMAT,
         DecodeFeatures::ATTN_SINK,
         DecodeFeatures::TOPK_LENGTH,
         DecodeFeatures::EXTRA_KVCACHE,
         DecodeFeatures::EXTRA_TOPK_LENGTH
     )
     using SupportedKVFormats = KVFormatPairs<KVFormatPair<ModelType::V32>, KVFormatPair<ModelType::V32_NO_ROPE>, KVFormatPair<ModelType::V4>,
-                                             KVFormatPair<ModelType::V41>, KVFormatPair<ModelType::V41, ModelType::V41_FP4>>;
+                                             KVFormatPair<ModelType::V41>, KVFormatPair<ModelType::V41, ModelType::V41_FP4>,
+                                             KVFormatPair<ModelType::GLM52_NVFP4>>;
 
 public:
     DecodeImplMeta get_meta(int h_q, int s_q) override {
@@ -238,7 +241,8 @@ sparse_attn_decode_interface(
     // Names the format of `kv` ("V32", "V32_NO_ROPE", "V4", "V41"). Only needed to disambiguate V3.2-no-RoPE from V4.1,
     // which have the same d_qk and bytes per token; when omitted the format is detected from the shape and 528 B per
     // token means V3.2-no-RoPE, so pre-V4.1 callers keep working unchanged.
-    const std::optional<std::string> &kv_format
+    const std::optional<std::string> &kv_format,
+    const std::optional<at::Tensor> &kv_global_scale
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -302,6 +306,7 @@ sparse_attn_decode_interface(
     KU_CHECK_DEVICE(extra_kv);
     KU_CHECK_DEVICE(extra_indices);
     KU_CHECK_DEVICE(extra_topk_length);
+    KU_CHECK_DEVICE(kv_global_scale);
 
     // Check data type
     KU_CHECK_DTYPE(q, torch::kBFloat16);
@@ -316,6 +321,7 @@ sparse_attn_decode_interface(
     KU_CHECK_DTYPE(num_splits, torch::kInt32);
     KU_CHECK_DTYPE(extra_indices, torch::kInt32);
     KU_CHECK_DTYPE(extra_topk_length, torch::kInt32);
+    KU_CHECK_DTYPE(kv_global_scale, torch::kFloat32);
     
     // Check layout
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
@@ -330,6 +336,7 @@ sparse_attn_decode_interface(
     KU_CHECK_LAST_DIM_CONTIGUOUS(extra_kv);
     KU_CHECK_LAST_DIM_CONTIGUOUS(extra_indices);
     KU_CHECK_CONTIGUOUS(extra_topk_length);
+    KU_CHECK_CONTIGUOUS(kv_global_scale);
     
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
@@ -338,7 +345,8 @@ sparse_attn_decode_interface(
     const std::optional<ModelType> kv_format_hint =
         kv_format.has_value() ? std::make_optional(parse_kv_cache_format(*kv_format)) : std::nullopt;
     if (d_qk == 576 && d_v == 512) {
-        model_type = extra_model_type = ModelType::V32;
+        model_type = extra_model_type =
+            kv_format_hint == ModelType::GLM52_NVFP4 ? ModelType::GLM52_NVFP4 : ModelType::V32;
     } else if (d_qk == 512 && d_v == 512) {
         model_type = kv_format_hint.value_or(detect_kv_cache_format_for_headdim_512(kv.size(3), kv_format_hint));
         extra_model_type = have_extra_kcache ? detect_kv_cache_format_for_headdim_512(extra_kv->size(3), model_type) : model_type;
@@ -348,6 +356,22 @@ sparse_attn_decode_interface(
     if (kv_format_hint.has_value()) {
         TORCH_CHECK(model_type == *kv_format_hint, "kv_format says ", get_dynamic_enum_name(*kv_format_hint),
             " but q/kv have d_qk ", d_qk, " and ", kv.size(3), " bytes per token");
+    }
+    if (model_type == ModelType::GLM52_NVFP4) {
+        TORCH_CHECK(arch.major == 10 && (arch.minor == 0 || arch.minor == 3) &&
+                    h_q == 64 && h_kv == 1 && topk == 2048 && page_block_size == 64,
+                    "GLM52_NVFP4 requires SM100/SM103, H64, TopK 2048 and page size 64");
+        TORCH_CHECK(!have_extra_kcache, "GLM52_NVFP4 does not support extra KV cache");
+        TORCH_CHECK(q.device() == kv.device() && q.device() == indices.device() &&
+                    (!topk_length.has_value() || q.device() == topk_length->device()) &&
+                    (!attn_sink.has_value() || q.device() == attn_sink->device()),
+                    "GLM52_NVFP4 inputs must be on the Q device");
+        TORCH_CHECK(kv.dtype() == torch::kUInt8, "GLM52_NVFP4 requires a uint8 KV cache");
+        TORCH_CHECK(kv_global_scale.has_value() && kv_global_scale->numel() == 1 &&
+                    kv_global_scale->get_device() == q.get_device(),
+                    "GLM52_NVFP4 requires one FP32 global scale on the Q device");
+    } else {
+        TORCH_CHECK(!kv_global_scale.has_value(), "kv_global_scale is only valid for GLM52_NVFP4");
     }
     TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
     TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
@@ -407,6 +431,8 @@ sparse_attn_decode_interface(
             features.push_back(DecodeFeatures::V41_KVCACHE_FORMAT);
         } else if (mt == ModelType::V41_FP4) {
             features.push_back(DecodeFeatures::V41_FP4_KVCACHE_FORMAT);
+        } else if (mt == ModelType::GLM52_NVFP4) {
+            features.push_back(DecodeFeatures::GLM52_NVFP4_KVCACHE_FORMAT);
         } else {
             TORCH_CHECK(false, "Unsupported model type: ", (int)mt);
         }
@@ -434,12 +460,21 @@ sparse_attn_decode_interface(
     }
 
     DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
+    if (model_type == ModelType::GLM52_NVFP4 && !tile_scheduler_metadata.has_value()) {
+        // TopK 2048 occupies 32 KV tiles; avoid launching empty partitions.
+        impl_meta.num_sm_parts = std::min(impl_meta.num_sm_parts, b * (32 + impl_meta.fixed_overhead_num_blocks));
+    } else if (model_type == ModelType::GLM52_NVFP4 && tile_scheduler_metadata.has_value()) {
+        // Graph callers supply preallocated scheduler metadata; retain its capture-time partition count.
+        TORCH_CHECK(tile_scheduler_metadata->size(0) > 0 && tile_scheduler_metadata->size(0) <= impl_meta.num_sm_parts);
+        impl_meta.num_sm_parts = tile_scheduler_metadata->size(0);
+    }
 
     SparseAttnDecodeParams params = {
         b, s_q, h_q, h_kv, d_qk, d_v,
         sm_scale, sm_scale * LOG_2_E,
         num_blocks, page_block_size, topk,
         model_type, extra_model_type,
+        ku::get_optional_tensor_ptr<float>(kv_global_scale),
 
         (bf16*)q.data_ptr(),
         (bf16*)kv.data_ptr(),
@@ -561,6 +596,7 @@ void register_sparse_decode(pybind11::module_& m) {
         pybind11::arg("tile_scheduler_metadata"), pybind11::arg("num_splits"),
         pybind11::arg("extra_kv"), pybind11::arg("extra_indices"), pybind11::arg("extra_topk_length"),
         pybind11::arg("d_v"), pybind11::arg("sm_scale"),
-        pybind11::arg("kv_format") = pybind11::none());
+        pybind11::arg("kv_format") = pybind11::none(),
+        pybind11::arg("kv_global_scale") = pybind11::none());
 }
 #endif

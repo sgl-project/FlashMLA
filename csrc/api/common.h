@@ -161,12 +161,12 @@ static constexpr std::string get_dynamic_enum_name(T value){
 inline ModelType parse_kv_cache_format(const std::string &name) {
     std::string upper;
     for (char c : name) upper += (char)std::toupper((unsigned char)c);
-    for (ModelType mt : {ModelType::V32, ModelType::V4, ModelType::V41, ModelType::V41_FP4, ModelType::V32_NO_ROPE}) {
+    for (ModelType mt : {ModelType::V32, ModelType::V4, ModelType::V41, ModelType::V41_FP4, ModelType::V32_NO_ROPE, ModelType::GLM52_NVFP4}) {
         if (upper == get_dynamic_enum_name(mt)) {
             return mt;
         }
     }
-    TORCH_CHECK(false, "Unknown kv_format: ", name, ". Expected one of V32, V32_NO_ROPE, V4, V41, V41_FP4");
+    TORCH_CHECK(false, "Unknown kv_format: ", name, ". Expected one of V32, V32_NO_ROPE, V4, V41, V41_FP4, GLM52_NVFP4");
 }
 
 // The format of a paged quantized KV cache with d_qk = 512 (V3.2-no-RoPE / V4 / V4.1 / V4.1 fp4), detected by

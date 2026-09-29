@@ -128,6 +128,8 @@ ext_modules.append(
             "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.cu",
 
             # sm100 sparse decode
+            "csrc/kernels/sm100/decode/sparse/head64/instantiations/glm52_nvfp4_h64.cu",
+            "csrc/kernels/sm100/decode/sparse/head64/instantiations/glm52_nvfp4_h64_no_split.cu",
             "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64.cu",
             "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64_no_split.cu",
             "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_no_rope_h64.cu",
