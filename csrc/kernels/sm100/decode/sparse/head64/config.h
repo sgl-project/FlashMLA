@@ -45,10 +45,10 @@ static constexpr int D_K = D_Q;
 static constexpr int D_V = 512;
 static constexpr int D_NOPE = OrigKVFormat::D_NOPE;
 static constexpr int D_ROPE = OrigKVFormat::D_ROPE;
-static constexpr int D_FP8 = OrigKVFormat::D_FP8;     // K dimensions stored as fp8 and needing dequant
+static constexpr int D_FP8 = OrigKVFormat::D_FP8 + OrigKVFormat::D_FP4; // Dequantized K dimensions (FP8 or FP4 storage)
 static constexpr int D_BF16 = OrigKVFormat::D_BF16;   // K dimensions stored as bf16 and not needing dequant
 static constexpr int QUANT_TILE_SIZE = OrigKVFormat::QUANT_TILE_SIZE;
-static constexpr bool V_HAVE_ROPE = OrigKVFormat::MODEL_TYPE == ModelType::V32 ? false : true;
+static constexpr bool V_HAVE_ROPE = !(OrigKVFormat::MODEL_TYPE == ModelType::V32 || OrigKVFormat::IS_GLM52_NVFP4);
 static constexpr int NUM_SCALES_EACH_TOKEN = OrigKVFormat::NUM_SCALES_EACH_TOKEN;    // Padding is included
 static constexpr int TMA_K_STRIDE = OrigKVFormat::TMA_K_STRIDE;   // Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32, 576 for V4 and 512 for V41. Extra padding may be necessary for KV blocks.
 static_assert(D_NOPE + D_ROPE == D_Q);
@@ -57,7 +57,7 @@ static_assert(V_HAVE_ROPE ? (D_NOPE + D_ROPE == D_V) : (D_NOPE == D_V));
 
 static constexpr int B_TOPK = 64;
 static constexpr int NUM_BUFS = 2;
-static constexpr int NUM_INDEX_BUFS = OrigKVFormat::IS_V32 ? 2 : 4;    // Number of buffers for indices (tma_coords) & is_token_valid & scales
+static constexpr int NUM_INDEX_BUFS = (OrigKVFormat::IS_V32 || OrigKVFormat::IS_GLM52_NVFP4) ? 2 : 4;    // Number of buffers for indices (tma_coords) & is_token_valid & scales
 
 // Both caches are dequantized into the same bf16 tile (B_TOPK x D_FP8, plus the bf16 part) by the same warpgroup, see KVBlockDequantizer
 static_assert(ExtraKVFormat::D_FP8 + ExtraKVFormat::D_FP4 == D_FP8 && ExtraKVFormat::D_BF16 == D_BF16);
@@ -73,13 +73,14 @@ static constexpr int SCALE_SMEM_STRIDE = std::max(
     OrigKVFormat::NUM_SCALES_EACH_TOKEN * OrigKVFormat::SCALE_SMEM_BYTES,
     ExtraKVFormat::NUM_SCALES_EACH_TOKEN * ExtraKVFormat::SCALE_SMEM_BYTES);
 template<typename F> using Dequantizer = KVBlockDequantizer<F, D_FP8, B_TOPK, RAW_TOKEN_SMEM_STRIDE<F>, SCALE_SMEM_STRIDE>;
+static constexpr int RAW_RING_BYTES = B_TOPK * std::max(RAW_TOKEN_SMEM_STRIDE<OrigKVFormat>, RAW_TOKEN_SMEM_STRIDE<ExtraKVFormat>);
 static constexpr int NUM_THREADS = 128*3;  // 128 exp + 1/32 utcmma + 1/32 raw KV producer + 1/32 rope producer + 32 index+scale+valid_mask producer + 128 dequant
 static constexpr float MAX_INIT_VAL = -1e30f;  // To avoid (-inf) - (-inf) = NaN
 
 static constexpr int D_Q_SW128 = 512;
-static constexpr int D_Q_SW64 = OrigKVFormat::MODEL_TYPE == ModelType::V32 ? 64 : 0;
+static constexpr int D_Q_SW64 = (OrigKVFormat::MODEL_TYPE == ModelType::V32 || OrigKVFormat::IS_GLM52_NVFP4) ? 64 : 0;
 static_assert(D_Q_SW128 + D_Q_SW64 == D_Q);
-static constexpr int K_ROPE_SW = D_BF16 == 0 ? 0 : (OrigKVFormat::IS_V32 ? 64 : 128); // RoPE part stored in SW64 (for V32) or SW128 (for V4), in bytes. 0 when there is no separate bf16 RoPE part (V41, V41_FP4, V32_NO_ROPE)
+static constexpr int K_ROPE_SW = D_BF16 == 0 ? 0 : ((OrigKVFormat::IS_V32 || OrigKVFormat::IS_GLM52_NVFP4) ? 64 : 128); // RoPE part stored in SW64 (for V32) or SW128 (for V4), in bytes. 0 when there is no separate bf16 RoPE part (V41, V41_FP4, V32_NO_ROPE)
 
 template<
     typename Shape_Q_SW128, typename TMA_Q_SW128,
@@ -199,8 +200,10 @@ struct SharedMemoryPlan {
                 alignas(1024) bf16 bf16_part[B_TOPK*D_BF16];   // bf16-origin part, swizzled as K_ROPE_SW
             } dequant[NUM_BUFS];
             static_assert(sizeof(dequant) >= sizeof(bf16) * (B_H*D_Q)); // So that Q does not cover raw_quant
-            array_aligned<uint8_t, B_TOPK*D_FP8, 128> raw_quant[NUM_BUFS];  // Raw (quantized) rows of a KV block, RAW_TOKEN_SMEM_STRIDE<F> apart. For V41, includes both NoPE and RoPE. 128 B aligned for gather4
-            static_assert(B_TOPK * RAW_TOKEN_SMEM_STRIDE<ExtraKVFormat> <= B_TOPK * D_FP8);
+            // Size the raw ring by its actual TMA box, not the dequantized BF16 dimensions.
+            // GLM-5.2 gathers 288 bytes (packed NoPE + scales), not 512 FP8 bytes.
+            array_aligned<uint8_t, RAW_RING_BYTES, 128> raw_quant[NUM_BUFS];
+            static_assert(B_TOPK * RAW_TOKEN_SMEM_STRIDE<ExtraKVFormat> <= RAW_RING_BYTES);
         } kv;
     } u;
     union {

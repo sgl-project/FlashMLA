@@ -118,12 +118,15 @@ struct KVBlockDequantizer {
     // before_first_store() runs once, right before the first STS, so that waiting for the tile to be free overlaps with the first
     // loads and conversions
     template<typename Fn>
-    CUTE_DEVICE void run(const uint8_t *raw, const uint8_t *scales, uint32_t dst, Fn &&before_first_store) const {
+    CUTE_DEVICE void run(const uint8_t *raw, const uint8_t *scales, uint32_t dst, Fn &&before_first_store,
+                         float global_scale = 1.f) const {
         CUTE_UNROLL
         for (int local_row_idx = 0; local_row_idx < ROWS_PER_GROUP; ++local_row_idx) {
             const int row_idx = local_row_idx * NUM_GROUPS + group_idx;
             alignas(16) uint8_t scales_row[SCALE_LOAD_BYTES];
-            copy_bytes<SCALE_LOAD_BYTES>(scales_row, scales + row_idx * SCALE_SMEM_STRIDE);
+            if constexpr (!F::IS_GLM52_NVFP4) {
+                copy_bytes<SCALE_LOAD_BYTES>(scales_row, scales + row_idx * SCALE_SMEM_STRIDE);
+            }
             const uint8_t *raw_row = raw + raw_offset + local_row_idx * NUM_GROUPS * RAW_TOKEN_SMEM_STRIDE;
             RawWord cur_data = *(const RawWord*)raw_row;
             CUTE_UNROLL
@@ -134,7 +137,15 @@ struct KVBlockDequantizer {
                 // Elements [local_col_idx*64 + idx_in_group*8, +8) of the row lie in this quant tile / word (see the ctor)
                 const int scale_idx_base = local_col_idx * ELEMS_PER_STEP / F::QUANT_TILE_SIZE;
                 ku::nvbf16x2 data_bf16[4];
-                if constexpr (F::IS_FP4) {
+                if constexpr (F::IS_GLM52_NVFP4) {
+                    // The 32 E4M3 scales travel with the 256 packed bytes in the 288-byte
+                    // TMA gather. Each lane handles eight values sharing a block-16 scale.
+                    const uint8_t code = raw[row_idx * RAW_TOKEN_SMEM_STRIDE + F::QUANT_BYTES +
+                                             scale_idx_base + idx_in_group / 2];
+                    const __half effective = __hmul(glm52_scale_to_half(code), __float2half_rn(global_scale));
+                    const __half2 pair_scale = __halves2half2(effective, effective);
+                    glm52_fp4x8_to_bf16x2x4(data, pair_scale, data_bf16);
+                } else if constexpr (F::IS_FP4) {
                     fp4x8_to_bf16x2x4(data, data_bf16);
                     const uint32_t scale_word = *(const uint32_t*)(scales_row + scale_idx_base);   // Constant offset: the array stays in registers
                     ku::nvbf16x2 scale = e4m3x2_to_bf16x2(__byte_perm(scale_word, 0, scale_prmt_sel11));   // (s, s)

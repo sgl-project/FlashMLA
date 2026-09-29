@@ -40,7 +40,8 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &extra_topk_length,
     int d_v,
     float sm_scale,
-    const std::optional<std::string> &kv_format
+    const std::optional<std::string> &kv_format,
+    const std::optional<at::Tensor> &kv_global_scale
 );
 
 std::vector<at::Tensor> sparse_attn_prefill_interface(
@@ -169,6 +170,7 @@ std::vector<at::Tensor> fwd_kvcache_mla(
             extra_topk_length,
             head_size_v_int,
             softmax_scale_float,
+            std::nullopt,
             std::nullopt);
         return {std::get<0>(result), std::get<1>(result)};
     }
