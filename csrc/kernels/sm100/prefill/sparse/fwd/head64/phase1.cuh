@@ -359,8 +359,14 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                 cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
                 if (!is_padding_row) {
                     int global_index = args.s_q_idx*params.h_q + idx_in_warpgroup;
-                    params.max_logits[global_index] = real_mi*CUDART_LN2_F;
-                    params.lse[global_index] = cur_lse;
+                    // Native FlashMLA uses natural-log units; SGL requests
+                    // base-2 statistics. Fuse only these final stores, leaving
+                    // the attention/sink normalization and empty-row sentinels
+                    // unchanged. real_mi is already in base-2 units.
+                    params.max_logits[global_index] = params.stats_in_log2
+                        ? real_mi : real_mi*CUDART_LN2_F;
+                    params.lse[global_index] = params.stats_in_log2
+                        ? cur_lse*CUDART_L2E_F : cur_lse;
                 }
             }
             

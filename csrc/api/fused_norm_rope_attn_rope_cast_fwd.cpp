@@ -146,6 +146,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
         (float*)lse.data_ptr(),
 
         arch.num_sms,
+        false, // Native prefill statistics remain in natural-log units.
         at::cuda::getCurrentCUDAStream().stream(),
 
         enable_q_norm,
