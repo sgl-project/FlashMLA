@@ -170,6 +170,8 @@ struct SparseAttnFwdParams {
     float* __restrict__ lse; // [s_q, h_q]
 
     int num_sm;
+    // Set only when the selected prefill kernel can emit base-2 statistics.
+    bool stats_in_log2 = false;
     cudaStream_t stream;
 };
 

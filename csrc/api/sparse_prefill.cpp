@@ -99,7 +99,8 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     float sm_scale,
     int d_v,
     const std::optional<at::Tensor> &attn_sink,
-    const std::optional<at::Tensor> &topk_length
+    const std::optional<at::Tensor> &topk_length,
+    bool return_log2_stats = false
 ) {
     using bf16 = cutlass::bfloat16_t;
     
@@ -160,6 +161,9 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     KU_CHECK_CONTIGUOUS(lse);
     KU_CHECK_CONTIGUOUS(max_logits);
 
+    // Keep the native API in natural-log units. The SGL compatibility binding
+    // requests base-2 units; only SM100 H64 currently fuses that conversion.
+    const bool fuse_log2_stats = return_log2_stats && is_sm100f && h_q == 64;
     SparseAttnFwdParams params = {
         s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
         sm_scale, sm_scale * LOG_2_E,
@@ -179,6 +183,7 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
         (float*)lse.data_ptr(),
 
         arch.num_sms,
+        fuse_log2_stats,
         at::cuda::getCurrentCUDAStream().stream()
     };
 
@@ -233,13 +238,22 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
         TORCH_CHECK(false, "Unsupported architecture");
     }
 
+    if (return_log2_stats && !fuse_log2_stats) {
+        max_logits.mul_(LOG_2_E);
+        lse.mul_(LOG_2_E);
+    }
     return {out, max_logits, lse};
 }
 
 #ifndef FLASH_MLA_LIBTORCH_ONLY
 void register_sparse_prefill(pybind11::module_& m) {
     m.def("sparse_prefill_fwd",
-        &sparse_attn_prefill_interface,
+        [](const at::Tensor &q, const at::Tensor &kv, const at::Tensor &indices,
+           float sm_scale, int d_v, const std::optional<at::Tensor> &attn_sink,
+           const std::optional<at::Tensor> &topk_length) {
+            return sparse_attn_prefill_interface(q, kv, indices, sm_scale, d_v,
+                                                attn_sink, topk_length);
+        },
         "Run Sparse Attention Prefill Forward");
 }
 #endif
