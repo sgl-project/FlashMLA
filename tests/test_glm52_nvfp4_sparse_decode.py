@@ -54,15 +54,17 @@ def test_glm52_nvfp4_sparse_decode(batch):
     kv = torch.cat((latent, rope_row), dim=-1)
     logits = torch.einsum("bhd,bkd->bhk", q[:, 0].float(), kv) * sm_scale
     logits.masked_fill_(~valid[:, None, :], -torch.inf)
+    expected_lse = torch.logsumexp(logits, dim=-1)
     probs = logits.softmax(dim=-1)
     expected = torch.einsum("bhk,bkd->bhd", probs, latent)
     if sink is not None:
-        mass = torch.exp(torch.logsumexp(logits, dim=-1))
-        expected *= (mass / (mass + sink.exp()[None, :])).unsqueeze(-1)
+        expected *= torch.sigmoid(expected_lse - sink[None, :]).unsqueeze(-1)
     expected = expected.to(torch.bfloat16)
     # The kernel rounds per-block probabilities to BF16 and uses split-KV reduction.
-    torch.testing.assert_close(out[:, 0], expected, atol=0.035, rtol=0.035)
-    assert torch.isfinite(lse).all()
+    torch.testing.assert_close(out[:, 0], expected, atol=1e-3, rtol=2e-2)
+    torch.testing.assert_close(
+        lse[:, :, 0], expected_lse, atol=2e-2, rtol=2e-2
+    )
 
     # Reuse caller-owned metadata, including across CUDA graph replays.
     graph_out, graph_lse, _, _ = flash_mla_with_kvcache_nvfp4(
