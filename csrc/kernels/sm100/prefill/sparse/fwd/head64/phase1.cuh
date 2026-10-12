@@ -352,8 +352,8 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
             NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
             li += plan.rowwise_li_buf[idx_in_warpgroup^64];
     
-            // Store mi and li
-            if (idx_in_warpgroup < B_H) {
+            // Store mi and li only when statistics were requested.
+            if (params.max_logits != nullptr && idx_in_warpgroup < B_H) {
                 bool is_padding_row = idx_in_warpgroup >= params.h_q;
                 float cur_lse = fmaf(mi, CUDART_LN2_F, logf(li));
                 cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;

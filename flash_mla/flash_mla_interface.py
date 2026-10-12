@@ -197,7 +197,8 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_log2_lse: Optional[bool] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Sparse attention prefill kernel
 
@@ -213,16 +214,23 @@ def flash_mla_sparse_fwd(
             This argument has no effect on lse and max_logits.
         topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k/v tokens (even if provided in indices).
             In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
+        return_log2_lse: None (default) preserves natural-log max_logits and lse.
+            True returns both statistics in base-2 units. False skips statistics
+            allocation and stores, returning None for max_logits and lse.
+            Unlike this native API, the SGL compatibility binding defaults to
+            True to preserve its existing base-2 contract. Output is unchanged.
 
     Returns:
         (output, max_logits, lse)
         Please refer to tests/ref.py for the precise definitions of these parameters.
         - output: [s_q, h_q, d_v], bfloat16
-        - max_logits:  [s_q, h_q], float
-        - lse: [s_q, h_q], float, log-sum-exp of attention scores
+        - max_logits: [s_q, h_q], float, or None when return_log2_lse is False
+        - lse: [s_q, h_q], float, log-sum-exp of attention scores, or None
+            when return_log2_lse is False. Statistics use natural-log units for
+            None and base-2 units for True.
     """
     results = flash_mla_cuda.sparse_prefill_fwd(
-        q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+        q, kv, indices, sm_scale, d_v, attn_sink, topk_length, return_log2_lse
     )
     return results
 

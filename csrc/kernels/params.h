@@ -166,11 +166,11 @@ struct SparseAttnFwdParams {
 
     // Output tensors
     cutlass::bfloat16_t* __restrict__ out;   // [s_q, h_q, d_v]
-    float* __restrict__ max_logits; // [s_q, h_q]
-    float* __restrict__ lse; // [s_q, h_q]
+    float* __restrict__ max_logits; // [s_q, h_q], nullptr in output-only mode
+    float* __restrict__ lse; // [s_q, h_q], nullptr in output-only mode
 
     int num_sm;
-    // Set only when the selected prefill kernel can emit base-2 statistics.
+    // Select base-2 instead of natural-log statistics in prefill final stores.
     bool stats_in_log2 = false;
     cudaStream_t stream;
 };

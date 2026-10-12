@@ -309,13 +309,15 @@ KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &
         NamedBarrier::arrive_and_wait(128, 0);
         li += plan.rowwise_li_buf[idx_in_warpgroup^64];
 
-        // Store mi and li
-        if (idx_in_warpgroup < 64) {
+        // Store mi and li only when statistics were requested.
+        if (params.max_logits != nullptr && idx_in_warpgroup < 64) {
             int global_index = s_q_idx*params.h_q + cta_idx*(B_H/2) + idx_in_warpgroup;
             float cur_lse = logf(li) + mi*CUDART_LN2_F;
             cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
-            params.max_logits[global_index] = real_mi*CUDART_LN2_F;
-            params.lse[global_index] = cur_lse;
+            params.max_logits[global_index] = params.stats_in_log2
+                ? real_mi : real_mi*CUDART_LN2_F;
+            params.lse[global_index] = params.stats_in_log2
+                ? cur_lse*CUDART_L2E_F : cur_lse;
         }
 
         // Wait for the last GEMM

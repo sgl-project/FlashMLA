@@ -92,7 +92,7 @@ protected:
     }
 };
 
-std::vector<at::Tensor> sparse_attn_prefill_interface(
+std::vector<std::optional<at::Tensor>> sparse_attn_prefill_interface(
     const at::Tensor &q,
     const at::Tensor &kv,
     const at::Tensor &indices,
@@ -100,7 +100,8 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     int d_v,
     const std::optional<at::Tensor> &attn_sink,
     const std::optional<at::Tensor> &topk_length,
-    bool return_log2_stats = false
+    bool return_log2_stats = false,
+    bool return_stats = true
 ) {
     using bf16 = cutlass::bfloat16_t;
     
@@ -155,15 +156,17 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
     auto opts = q.options();
     
     at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
-    at::Tensor lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
-    at::Tensor max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    std::optional<at::Tensor> lse, max_logits;
+    if (return_stats) {
+        lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+        max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+        KU_CHECK_CONTIGUOUS(lse);
+        KU_CHECK_CONTIGUOUS(max_logits);
+    }
     KU_CHECK_CONTIGUOUS(out);
-    KU_CHECK_CONTIGUOUS(lse);
-    KU_CHECK_CONTIGUOUS(max_logits);
 
-    // Keep the native API in natural-log units. The SGL compatibility binding
-    // requests base-2 units; only SM100 H64 currently fuses that conversion.
-    const bool fuse_log2_stats = return_log2_stats && is_sm100f && h_q == 64;
+    // All prefill kernels emit the requested units in their final stores.
+    // Null stats pointers select output-only mode without extra allocations.
     SparseAttnFwdParams params = {
         s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
         sm_scale, sm_scale * LOG_2_E,
@@ -179,11 +182,11 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
         int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
 
         (bf16*)out.data_ptr(),
-        (float*)max_logits.data_ptr(),
-        (float*)lse.data_ptr(),
+        ku::get_optional_tensor_ptr<float>(max_logits),
+        ku::get_optional_tensor_ptr<float>(lse),
 
         arch.num_sms,
-        fuse_log2_stats,
+        return_log2_stats,
         at::cuda::getCurrentCUDAStream().stream()
     };
 
@@ -238,10 +241,6 @@ std::vector<at::Tensor> sparse_attn_prefill_interface(
         TORCH_CHECK(false, "Unsupported architecture");
     }
 
-    if (return_log2_stats && !fuse_log2_stats) {
-        max_logits.mul_(LOG_2_E);
-        lse.mul_(LOG_2_E);
-    }
     return {out, max_logits, lse};
 }
 
@@ -250,10 +249,18 @@ void register_sparse_prefill(pybind11::module_& m) {
     m.def("sparse_prefill_fwd",
         [](const at::Tensor &q, const at::Tensor &kv, const at::Tensor &indices,
            float sm_scale, int d_v, const std::optional<at::Tensor> &attn_sink,
-           const std::optional<at::Tensor> &topk_length) {
+           const std::optional<at::Tensor> &topk_length,
+           std::optional<bool> return_log2_lse = std::nullopt) {
+            // None preserves the native natural-log default; unlike the SGL
+            // compatibility binding, base-2 statistics require explicit True.
             return sparse_attn_prefill_interface(q, kv, indices, sm_scale, d_v,
-                                                attn_sink, topk_length);
+                                                attn_sink, topk_length,
+                                                return_log2_lse.value_or(false),
+                                                return_log2_lse.value_or(true));
         },
+        pybind11::arg("q"), pybind11::arg("kv"), pybind11::arg("indices"),
+        pybind11::arg("sm_scale"), pybind11::arg("d_v"), pybind11::arg("attn_sink"),
+        pybind11::arg("topk_length"), pybind11::arg("return_log2_lse") = std::nullopt,
         "Run Sparse Attention Prefill Forward");
 }
 #endif
