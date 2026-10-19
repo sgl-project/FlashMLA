@@ -440,22 +440,29 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
             reduce_L();
             store_O();
 
-            // Save lse
+            // Save statistics in the requested units, if present.
             if (idx_in_warpgroup%4 == 0) {
-                for (int row = 0; row < 2; ++row) {
-                    int real_row = get_AorC_row_idx(row, idx_in_warpgroup);
-                    bool is_no_valid_tokens = rL[row] == 0.0f;
-                    plan.final_max_logits[real_row] = is_no_valid_tokens ? -INFINITY : rM[row]*CUDART_LN2_F;
-                    plan.final_lse[real_row] = is_no_valid_tokens ? +INFINITY : logf(rL[row]) + rM[row]*CUDART_LN2_F;
+                if (params.max_logits != nullptr) {
+                    for (int row = 0; row < 2; ++row) {
+                        int real_row = get_AorC_row_idx(row, idx_in_warpgroup);
+                        bool is_no_valid_tokens = rL[row] == 0.0f;
+                        float cur_lse = logf(rL[row]) + rM[row]*CUDART_LN2_F;
+                        plan.final_max_logits[real_row] = is_no_valid_tokens ? -INFINITY
+                            : (params.stats_in_log2 ? rM[row] : rM[row]*CUDART_LN2_F);
+                        plan.final_lse[real_row] = is_no_valid_tokens ? +INFINITY
+                            : (params.stats_in_log2 ? cur_lse*CUDART_L2E_F : cur_lse);
+                    }
                 }
                 fence_view_async_shared();
             }
 
             NamedBarrier::arrive_and_wait(128, NamedBarriers::warpgroup1_sync);
             if (idx_in_warpgroup == 0) {
-                int g_offset = s_q_idx*params.h_q + q_h_idx*B_H;
-                SM90_BULK_COPY_S2G::copy(plan.final_max_logits, params.max_logits + g_offset, B_H*sizeof(float));
-                SM90_BULK_COPY_S2G::copy(plan.final_lse, params.lse + g_offset, B_H*sizeof(float));
+                if (params.max_logits != nullptr) {
+                    int g_offset = s_q_idx*params.h_q + q_h_idx*B_H;
+                    SM90_BULK_COPY_S2G::copy(plan.final_max_logits, params.max_logits + g_offset, B_H*sizeof(float));
+                    SM90_BULK_COPY_S2G::copy(plan.final_lse, params.lse + g_offset, B_H*sizeof(float));
+                }
                 cute::tma_store_arrive();
             }
         }

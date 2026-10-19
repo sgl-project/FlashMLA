@@ -935,9 +935,13 @@ KernelTemplate<FWD_MODE, D_QK, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_ke
                 float cur_lse = fmaf(mi, CUDART_LN2_F, logf(li));
                 cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
                 if constexpr (IS_PREFILL) {
-                    int global_index = args.s_q_idx*params.h_q + head_idx;
-                    params.max_logits[global_index] = real_mi*CUDART_LN2_F;
-                    params.lse[global_index] = cur_lse;
+                    if (params.max_logits != nullptr) {
+                        int global_index = args.s_q_idx*params.h_q + head_idx;
+                        params.max_logits[global_index] = params.stats_in_log2
+                            ? real_mi : real_mi*CUDART_LN2_F;
+                        params.lse[global_index] = params.stats_in_log2
+                            ? cur_lse*CUDART_L2E_F : cur_lse;
+                    }
                 } else {
                     if (FWD_MODE != FwdMode::DecodeWithSplitKV || args.is_no_split) {
                         params.lse[args.batch_idx*params.stride_lse_b + args.s_q_idx*params.stride_lse_s_q + head_idx] = cur_lse;

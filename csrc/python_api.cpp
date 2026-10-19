@@ -43,14 +43,16 @@ sparse_attn_decode_interface(
     const std::optional<std::string> &kv_format
 );
 
-std::vector<at::Tensor> sparse_attn_prefill_interface(
+std::vector<std::optional<at::Tensor>> sparse_attn_prefill_interface(
     const at::Tensor &q,
     const at::Tensor &kv,
     const at::Tensor &indices,
     float sm_scale,
     int d_v,
     const std::optional<at::Tensor> &attn_sink,
-    const std::optional<at::Tensor> &topk_length
+    const std::optional<at::Tensor> &topk_length,
+    bool return_log2_stats,
+    bool return_stats
 );
 
 std::vector<at::Tensor> get_mla_decoding_metadata(
@@ -193,24 +195,25 @@ std::vector<at::Tensor> fwd_kvcache_mla(
     return {std::get<0>(result), std::get<1>(result)};
 }
 
-std::vector<at::Tensor> sparse_prefill_fwd(
+std::vector<std::optional<at::Tensor>> sparse_prefill_fwd(
     const at::Tensor& q,
     const at::Tensor& kv,
     const at::Tensor& indices,
     double sm_scale,
     int64_t d_v,
     const std::optional<at::Tensor>& attn_sink = std::nullopt,
-    const std::optional<at::Tensor>& topk_length = std::nullopt) {
-    auto result = sparse_attn_prefill_interface(
+    const std::optional<at::Tensor>& topk_length = std::nullopt,
+    bool return_log2_lse = true) {
+    // Preserve SGL's base-2 default (the native API defaults to natural logs).
+    // False requests only the attention output, with None for both statistics.
+    return sparse_attn_prefill_interface(
         q,
         kv,
         indices,
         static_cast<float>(sm_scale),
         static_cast<int>(d_v),
         attn_sink,
-        topk_length);
-    // Keep SGL compatibility: this API historically returns max_logits/lse in log2 space.
-    result[1].mul_(LOG_2_E);
-    result[2].mul_(LOG_2_E);
-    return result;
+        topk_length,
+        /*return_log2_stats=*/true,
+        /*return_stats=*/return_log2_lse);
 }
