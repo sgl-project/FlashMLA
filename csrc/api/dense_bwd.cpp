@@ -1,11 +1,11 @@
 #include "common.h"
 
-#include "kernels/sm100/prefill/dense/interface.h"
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+#include "cuda_kernels/sm100/prefill/dense/interface.h"
+#endif  // FLASH_MLA_IS_BUILD_ON_CUDA
 
-#ifndef FLASH_MLA_LIBTORCH_ONLY
-void register_dense_bwd(pybind11::module_& m) {
-    m.def("dense_prefill_bwd",
-        &FMHACutlassSM100BwdRun,
-        "Run Dense Attention Prefill Backward (cutlass FMHA)");
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+STABLE_TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
+    m.impl("dense_prefill_bwd", TORCH_BOX(&FMHACutlassSM100BwdRun));
 }
-#endif
+#endif  // FLASH_MLA_IS_BUILD_ON_CUDA

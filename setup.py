@@ -1,194 +1,328 @@
 import os
-from pathlib import Path
-from datetime import datetime
+import sys
 import subprocess
+from pathlib import Path
 
 from setuptools import setup, find_packages
 
-from torch.utils.cpp_extension import (
-    BuildExtension,
-    CUDAExtension,
-    IS_WINDOWS,
-    CUDA_HOME
-)
+from setup_legacy_sources import LEGACY_CUDA_ARCHS, legacy_sources
 
+# The frozen pre-2026.09.30 kernels build as their own extension: their own op namespace and
+# their own architectures, but the same stable C++ ABI as the current kernels, so that the wheel
+# is abi3 as a whole. FLASH_MLA_BUILD_LEGACY=0 ships only the current kernels.
+# See csrc_legacy/README.md.
+OUR_OP_SOURCES = ["csrc_ops/sched_meta.cpp"]
+EXT_NAME_LEGACY = "flash_mla._C_legacy"
+BUILD_LEGACY = os.environ.get("FLASH_MLA_BUILD_LEGACY", "1") == "1"
 
-def is_flag_set(flag: str) -> bool:
-    return os.getenv(flag, "FALSE").lower() in ["true", "1", "y", "yes"]
+# The CUTLASS FMHA dense prefill is upstream's, and it is half the CUDA extension's object code
+# (29 MB of 61 MB) for an op SGLang never calls -- it is not a DeepSeek MLA kernel at all, just a
+# dense attention one that happens to live here. It is left out by default; a build that needs
+# `dense_prefill_fwd` / `dense_prefill_bwd` sets FLASH_MLA_BUILD_DENSE_PREFILL=1. The schemas
+# still come from upstream's csrc/api/api.cpp, so the ops exist but have no CUDA kernel
+# registered, and calling one raises rather than failing the load.
+BUILD_DENSE_PREFILL = os.environ.get("FLASH_MLA_BUILD_DENSE_PREFILL", "0") == "1"
 
-def get_features_args():
-    features_args = []
-    if is_flag_set("FLASH_MLA_DISABLE_FP16"):
-        features_args.append("-DFLASH_MLA_DISABLE_FP16")
-    return features_args
+THIS_DIR = Path(__file__).resolve().parent
 
-def get_arch_flags():
-    # Check NVCC Version
-    # NOTE The "CUDA_HOME" here is not necessarily from the `CUDA_HOME` environment variable. For more details, see `torch/utils/cpp_extension.py`
-    assert CUDA_HOME is not None, "PyTorch must be compiled with CUDA support"
-    nvcc_version = subprocess.check_output(
-        [os.path.join(CUDA_HOME, "bin", "nvcc"), '--version'], stderr=subprocess.STDOUT
-    ).decode('utf-8')
-    nvcc_version_number = nvcc_version.split('release ')[1].split(',')[0].strip()
-    major, minor = map(int, nvcc_version_number.split('.'))
-    print(f'Compiling using NVCC {major}.{minor}')
+# Stable dispatcher API shared by both build platforms. The fused kernels live
+# in their own translation unit.
+API_SOURCES = [
+    "csrc/api/api.cpp",
+    "csrc/api/sparse_prefill.cpp",
+    "csrc/api/sparse_decode.cpp",
+    "csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp",
+]
 
-    DISABLE_SM100 = is_flag_set("FLASH_MLA_DISABLE_SM100")
-    DISABLE_SM90 = is_flag_set("FLASH_MLA_DISABLE_SM90")
-    if major < 12 or (major == 12 and minor <= 8):
-        assert DISABLE_SM100, "sm100 compilation for Flash MLA requires NVCC 12.9 or higher. Please set FLASH_MLA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."    # TODO Implement this
+DENSE_PREFILL_SOURCES = [
+    "csrc/api/dense_fwd.cpp",
+    "csrc/api/dense_bwd.cpp",
+    # sm100 dense prefill (cutlass FMHA): forward and backward
+    "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
+    "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
+]
 
+# The extension modules, one per build platform
+EXT_NAME_CUDA = "flash_mla.cuda"
+
+# `-gencode` targets. We use the architecture-specific ones (sm_100a / sm_103a) instead of the
+# family-specific one (sm_100f) because the kernels use `cvt` with `.scaled::n2::ue8m0`, and
+# sm_103a additionally enables better code generation for `exp`.
+CUDA_ARCHS = ["sm_100a", "sm_103a"]
+
+# Build against PyTorch's stable C++ ABI.
+STABLE_ABI_FLAGS = [
+    "-DTORCH_TARGET_VERSION=0x020a000000000000",  # PyTorch >= 2.10
+]
+CUDA_STABLE_ABI_FLAGS = [*STABLE_ABI_FLAGS, "-DUSE_CUDA"]
+
+# Head counts (H_Q) the fused core_attn kernel is instantiated for: 128 (2-CTA cluster) and 64
+HEADS_FOR_FUSED_CORE_ATTN = (64, 128)
+
+CUDA_KERNEL_SOURCES = [
+    # Small kernels for decoding: tile scheduler metadata generation and the split-KV combine
+    "csrc/cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+    "csrc/cuda_kernels/smxx/decode/combine/combine.cu",
+
+    # sm100 sparse prefill
+    "csrc/cuda_kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu",
+    "csrc/cuda_kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
+
+    # sm100 sparse prefill for small topk, and head128 decoding
+    "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_k512.cu",
+    "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41.cu",
+    "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu",
+    "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4.cu",
+    "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4_splitkv.cu",
+
+    # sm100 sparse decode (head 64, with and without split-KV, on the fp8 and the fp4 cache)
+    "csrc/cuda_kernels/sm100/decode/sparse/head64/instantiations/v41_h64.cu",
+    "csrc/cuda_kernels/sm100/decode/sparse/head64/instantiations/v41_h64_no_split.cu",
+    "csrc/cuda_kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64.cu",
+    "csrc/cuda_kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64_no_split.cu",
+
+    # Fused Norm + RoPE + Core Attn + RoPE + Cast: 6 instantiations per head count
+    # (V4.1 fp8 prefill, V4.1 fp8 decode and V4.1 fp4 decode, each with and without q norm)
+    *[f"csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/{model}_h{h}_{mode}_{norm}.cu"
+      for h in HEADS_FOR_FUSED_CORE_ATTN
+      for model, mode in (("v41", "prefill"), ("v41", "decode"), ("v41fp4", "decode"))
+      for norm in ("norm", "nonorm")],
+    "csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.cu",
+    "csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.cu",
+]
+def get_cuda_arch_flags(archs=None):
     arch_flags = []
-    if not DISABLE_SM100:
-        # We use architecture-specific (sm_100a / sm_103a) targets instead of the family-specific one (sm_100f) for better SASS code generation
-        arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a"])
-        arch_flags.extend(["-gencode", "arch=compute_103a,code=sm_103a"])
-    if not DISABLE_SM90:
-        arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
+    for arch in (CUDA_ARCHS if archs is None else archs):
+        compute_arch = arch.removeprefix("sm_")
+        arch_flags.extend(["-gencode", f"arch=compute_{compute_arch},code={arch}"])
     return arch_flags
+
+
+# Exempt from the spill check: upstream's split-KV h64 sparse decode really does spill --
+# ptxas reports 20 bytes spill stores / 28 bytes spill loads in a 16-byte stack frame, on CUDA
+# 13.2/13.3/13.4 alike. Unchanged from upstream 0f11e17, whose own build fails its own check
+# here. Verified correct on sm_103a hardware, so this is a perf cost upstream ships, not a bug.
+KNOWN_UPSTREAM_FRAME_KERNELS = ("flash_fwd_splitkv_mla_fp8_sparse_kernel",)
+
+
+def is_known_upstream_frame(mangled_name: str) -> bool:
+    return any(k in mangled_name for k in KNOWN_UPSTREAM_FRAME_KERNELS)
+
 
 def get_nvcc_thread_args():
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return ["--threads", nvcc_threads]
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
-this_dir = os.path.dirname(os.path.abspath(__file__))
-
-if IS_WINDOWS:
-    cxx_args = ["/O2", "/std:c++20", "/DNDEBUG", "/W0"]
-else:
-    cxx_args = ["-O3", "-std=c++20", "-DNDEBUG", "-Wno-deprecated-declarations"]
-
-ext_modules = []
-ext_modules.append(
-    CUDAExtension(
-        name="flash_mla.cuda",
-        sources=[
-            # API
-            "csrc/api/api.cpp",
-            "csrc/api/sparse_prefill.cpp",
-            "csrc/api/sparse_decode.cpp",
-            "csrc/api/dense_fwd.cpp",
-            "csrc/api/dense_bwd.cpp",
-            "csrc/api/dense_decode.cpp",
-            "csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp",
-
-            # Misc kernels for decoding
-            "csrc/kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
-            "csrc/kernels/smxx/decode/combine/combine.cu",
-
-            # sm90 dense decode
-            "csrc/kernels/sm90/decode/dense/instantiations/fp16.cu",
-            "csrc/kernels/sm90/decode/dense/instantiations/bf16.cu",
-
-            # sm90 sparse decode
-            "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h64.cu",
-            "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h128.cu",
-            "csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h64.cu",
-            "csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h128.cu",
-            "csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h64.cu",
-            "csrc/kernels/sm90/decode/sparse/instantiations/v32_no_rope_persistent_h128.cu",
-
-            # sm90 sparse prefill
-            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512.cu",
-            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
-            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576.cu",
-            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
-
-            # sm100 dense prefill & backward
-            "csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-            "csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
-
-            # sm100 sparse prefill
-            "csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k576.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_k512.cu",
-
-            # sm100 fused norm + rope + attn + rope + cast
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_prefill_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_prefill_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_prefill_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_prefill_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h64_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h64_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h128_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h128_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h64_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h64_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h128_decode_norm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h128_decode_nonorm.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.cu",
-            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.cu",
-
-            # sm100 sparse decode
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64_no_split.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_no_rope_h64.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_no_rope_h64_no_split.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v4_h64.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v4_h64_no_split.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41_h64.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41_h64_no_split.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64.cu",
-            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64_no_split.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_splitkv.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4.cu",
-            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4_splitkv.cu",
-        ],
-        extra_compile_args={
-            "cxx": cxx_args + get_features_args(),
-            "nvcc": [
-                "-O3",
-                "-std=c++20",
-                "-DNDEBUG",
-                "-D_USE_MATH_DEFINES",
-                "-Wno-deprecated-declarations",
-                "-U__CUDA_NO_HALF_OPERATORS__",
-                "-U__CUDA_NO_HALF_CONVERSIONS__",
-                "-U__CUDA_NO_HALF2_OPERATORS__",
-                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                "--expt-relaxed-constexpr",
-                "--expt-extended-lambda",
-                "--use_fast_math",
-                "--ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-local-memory-usage,--warn-on-double-precision-use",
-                "-lineinfo",
-                "--source-in-ptx",
-            ] + get_features_args() + get_arch_flags() + get_nvcc_thread_args(),
-        },
-        include_dirs=[
-            Path(this_dir) / "csrc",
-            Path(this_dir) / "csrc" / "kerutils" / "include",
-            Path(this_dir) / "csrc" / "cutlass" / "include",
-            Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
-            Path(CUDA_HOME) / "targets" / "x86_64-linux" / "include" / "cccl",   # for cuda/std headers in CUDA 13+
-            Path(CUDA_HOME) / "targets" / "sbsa-linux" / "include" / "cccl",
-        ],
+def build_on_cuda_platform():
+    from torch.utils.cpp_extension import (
+        BuildExtension,
+        CUDAExtension,
+        CUDA_HOME,
     )
-)
 
-try:
-    cmd = ['git', 'rev-parse', '--short', 'HEAD']
-    rev = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
-except Exception as _:
-    now = datetime.now()
-    date_time_str = now.strftime("%Y-%m-%d-%H-%M-%S")
-    rev = '+' + date_time_str
+    # NOTE The "CUDA_HOME" here is not necessarily from the `CUDA_HOME` environment variable.
+    # For more details, see `torch/utils/cpp_extension.py`
+    assert CUDA_HOME is not None, "PyTorch must be compiled with CUDA support"
+    nvcc_version = subprocess.check_output(
+        [os.path.join(CUDA_HOME, "bin", "nvcc"), "--version"], stderr=subprocess.STDOUT
+    ).decode("utf-8")
+    nvcc_version_number = nvcc_version.split("release ")[1].split(",")[0].strip()
+    major, minor = map(int, nvcc_version_number.split("."))
+    print(f"Compiling using NVCC {major}.{minor}")
+    assert major > 13 or (major == 13 and minor >= 1), \
+        "Compiling the kernels requires NVCC 13.1 or higher (cvt with .scaled::n2::ue8m0)."
+
+    class BuildExtensionWithPostActions(BuildExtension):
+        """
+        Run the register-spill check after building.
+        """
+        def run(self):
+            super().run()
+
+            if not self.dry_run:
+                from tests.kernelkit import check_kernel_reg_spill_in_artifact
+
+                so_paths = [
+                    os.path.join(self.build_lib, self.get_ext_filename(EXT_NAME_CUDA)),
+                    self.get_ext_fullpath(EXT_NAME_CUDA),    # May point to the extension in the source tree for editable installs
+                ]
+                so_paths = list(set(so_paths))  # deduplicate
+                assert CUDA_HOME is not None, "PyTorch must be compiled with CUDA support"
+                for so_path in so_paths:
+                    spilled_kernels = check_kernel_reg_spill_in_artifact(
+                        so_path, quiet=True, suppress_checking_env_var="FLASH_MLA_SKIP_REG_SPILL_CHECK"
+                    )
+                    # The restored upstream CUTLASS FMHA kernels (cutlass::device_kernel<...>) keep
+                    # their stack frames, so they are exempt. Only the kernels defined by this
+                    # repository have to be spill-free.
+                    own_spilled_kernels = [
+                        name for name in spilled_kernels
+                        if not name.startswith("_ZN7cutlass") and not is_known_upstream_frame(name)
+                    ]
+                    num_exempt_kernels = len(spilled_kernels) - len(own_spilled_kernels)
+                    if num_exempt_kernels > 0:
+                        print(f"{num_exempt_kernels} upstream kernel(s) keep their stack frames (exempt)")
+                    if len(own_spilled_kernels) > 0:
+                        for kernel_name in own_spilled_kernels:
+                            print(f"  {kernel_name}")
+                        print("Register spilling detected. Build failed!")
+                        sys.exit(1)
+
+    ext_modules = [
+        CUDAExtension(
+            name=EXT_NAME_CUDA,
+            sources=[
+                *API_SOURCES,
+                *(DENSE_PREFILL_SOURCES if BUILD_DENSE_PREFILL else []),
+                *CUDA_KERNEL_SOURCES,
+                # Ours, not upstream's: an op upstream does not register. It lives outside
+                # csrc/ so that directory can be replaced wholesale on a sync.
+                *OUR_OP_SOURCES,
+            ],
+            extra_compile_args={
+                # The host-side (`.cpp`) translation units are not compiled by nvcc, so `__CUDACC__`
+                # is not defined and neither kerutils' nor our own platform switch is set automatically.
+                "cxx": [
+                    *CUDA_STABLE_ABI_FLAGS,
+                    "-O3",
+                    "-std=c++20",
+                    "-DNDEBUG",
+                    "-Wno-deprecated-declarations",
+                    "-DFLASH_MLA_IS_BUILD_ON_CUDA",
+                    "-DKERUTILS_IS_BUILD_ON_CUDA",
+                ],
+                "nvcc": get_nvcc_thread_args() + CUDA_STABLE_ABI_FLAGS + [
+                    "-O3",
+                    "-std=c++20",
+                    "-Wno-deprecated-declarations",
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "-U__CUDA_NO_HALF2_OPERATORS__",
+                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    "--use_fast_math",
+                    "--ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-local-memory-usage,--warn-on-double-precision-use",
+                    # Shrinks the fatbin; nvcc 13.0+. Upstream's -lineinfo / --source-in-ptx
+                    # are dropped with it: together they take the wheel from 21 MB to 8 MB
+                    # and neither changes codegen (resource usage is identical either way).
+                    "--compress-mode=size",
+                    "--diag-suppress=445",  # "constant "N" is not used in declaring the parameter types of function template"
+                    "-DNDEBUG",
+                    "-DFLASH_MLA_IS_BUILD_ON_CUDA",
+                ] + get_cuda_arch_flags(),
+            },
+            include_dirs=[
+                THIS_DIR / "csrc",
+                THIS_DIR / "csrc_ops",
+                THIS_DIR / "csrc" / "3rdparty" / "cutlass" / "include",
+                THIS_DIR / "csrc" / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+                THIS_DIR / "csrc" / "3rdparty" / "kerutils" / "include",
+                Path(CUDA_HOME) / "targets" / "x86_64-linux" / "include" / "cccl",    # for cuda/std headers in CUDA 13+
+                Path(CUDA_HOME) / "targets" / "sbsa-linux" / "include" / "cccl",
+            ],
+            # On a machine without the NVIDIA driver (e.g. a CPU-only build node) `-lcuda` needs
+            # the stub libraries that ship with the toolkit
+            extra_link_args=[
+                f"-L{Path(CUDA_HOME) / 'targets' / 'x86_64-linux' / 'lib' / 'stubs'}",
+                f"-L{Path(CUDA_HOME) / 'targets' / 'sbsa-linux' / 'lib' / 'stubs'}",
+                "-lcuda",
+            ],
+            # Registration uses STABLE_TORCH_LIBRARY and does not need the
+            # Python C API, so one extension can serve every CPython >= 3.10.
+            py_limited_api=True,
+        ),
+    ]
+
+    if BUILD_LEGACY:
+        # The frozen tree is built against the stable ABI too. A wheel is only as portable as its
+        # least portable extension, so one CPython-locked extension here would undo the abi3 build
+        # of the current kernels above, whatever the wheel tag says.
+        ext_modules.append(CUDAExtension(
+            name=EXT_NAME_LEGACY,
+            sources=legacy_sources(),
+            extra_compile_args={
+                "cxx": [
+                    *CUDA_STABLE_ABI_FLAGS,
+                    "-O3",
+                    "-std=c++20",
+                    "-DNDEBUG",
+                    "-Wno-deprecated-declarations",
+                    "-DFLASH_MLA_IS_BUILD_ON_CUDA",
+                    "-DKERUTILS_IS_BUILD_ON_CUDA",
+                    # Export only the module entry point and the op registration: the two
+                    # extensions are loaded into one process and must not see each other.
+                    "-fvisibility=hidden",
+                    "-fvisibility-inlines-hidden",
+                ],
+                "nvcc": get_nvcc_thread_args() + CUDA_STABLE_ABI_FLAGS + [
+                    "-O3",
+                    "-std=c++20",
+                    "-Wno-deprecated-declarations",
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "-U__CUDA_NO_HALF2_OPERATORS__",
+                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    "--use_fast_math",
+                    "--compress-mode=size",
+                    "--diag-suppress=445",
+                    "-DNDEBUG",
+                    "-DFLASH_MLA_IS_BUILD_ON_CUDA",
+                    "-Xcompiler", "-fvisibility=hidden",
+                ] + get_cuda_arch_flags(LEGACY_CUDA_ARCHS),
+            },
+            include_dirs=[
+                THIS_DIR / "csrc_legacy",
+                # The vendored dependencies are shared. The legacy tree pins none of its own, so
+                # an upstream cutlass bump still reaches it; give csrc_legacy its own 3rdparty/
+                # and change these lines if that ever matters.
+                THIS_DIR / "csrc" / "3rdparty" / "cutlass" / "include",
+                THIS_DIR / "csrc" / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+                THIS_DIR / "csrc" / "3rdparty" / "kerutils" / "include",
+                Path(CUDA_HOME) / "targets" / "x86_64-linux" / "include" / "cccl",
+                Path(CUDA_HOME) / "targets" / "sbsa-linux" / "include" / "cccl",
+            ],
+            extra_link_args=[
+                f"-L{Path(CUDA_HOME) / 'targets' / 'x86_64-linux' / 'lib' / 'stubs'}",
+                f"-L{Path(CUDA_HOME) / 'targets' / 'sbsa-linux' / 'lib' / 'stubs'}",
+                "-lcuda",
+            ],
+            # Registration is STABLE_TORCH_LIBRARY here too, so this extension needs no more of
+            # the Python C API than the current one does.
+            py_limited_api=True,
+        ))
+
+    return ext_modules, BuildExtensionWithPostActions
 
 
-setup(
-    name="flash_mla",
-    version="1.0.0" + rev,
-    packages=find_packages(include=['flash_mla']),
-    ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension},
-)
+
+def get_version() -> str:
+    try:
+        rev = "+" + subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=THIS_DIR, stderr=subprocess.DEVNULL
+        ).decode("ascii").rstrip()
+    except Exception:
+        rev = ""
+    return "1.0.0" + rev
+
+
+def main():
+    # CUDA only; this fork does not carry upstream's Ascend NPU target.
+    ext_modules, build_ext = build_on_cuda_platform()
+    print(f"Building {len(ext_modules)} extension(s): {[e.name for e in ext_modules]}")
+
+    setup(
+        name="flash_mla",
+        version=get_version(),
+        packages=find_packages(include=["flash_mla"]),
+        ext_modules=ext_modules,
+        cmdclass={"build_ext": build_ext},
+        options={"bdist_wheel": {"py_limited_api": "cp310"}},
+    )
+
+
+if __name__ == "__main__":
+    main()
