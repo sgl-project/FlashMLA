@@ -204,8 +204,10 @@ def build_on_cuda_platform():
                     "--expt-extended-lambda",
                     "--use_fast_math",
                     "--ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-local-memory-usage,--warn-on-double-precision-use",
-                    "-lineinfo",
-                    "--source-in-ptx",
+                    # Shrinks the fatbin; nvcc 13.0+. Upstream's -lineinfo / --source-in-ptx
+                    # are dropped with it: together they take the wheel from 21 MB to 8 MB
+                    # and neither changes codegen (resource usage is identical either way).
+                    "--compress-mode=size",
                     "--diag-suppress=445",  # "constant "N" is not used in declaring the parameter types of function template"
                     "-DNDEBUG",
                     "-DFLASH_MLA_IS_BUILD_ON_CUDA",
@@ -265,8 +267,7 @@ def build_on_cuda_platform():
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
                     "--use_fast_math",
-                    "-lineinfo",
-                    "--source-in-ptx",
+                    "--compress-mode=size",
                     "--diag-suppress=445",
                     "-DNDEBUG",
                     "-DFLASH_MLA_IS_BUILD_ON_CUDA",
