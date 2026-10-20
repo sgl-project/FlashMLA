@@ -1,4 +1,7 @@
-__version__ = "1.0.0"
+import os as _os
+
+with open(_os.path.join(_os.path.dirname(__file__), "VERSION")) as _f:
+    __version__ = _f.read().strip()
 
 from flash_mla._loader import has_legacy
 from flash_mla.flash_mla_interface import (

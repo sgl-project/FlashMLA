@@ -24,6 +24,7 @@ BUILD_LEGACY = os.environ.get("FLASH_MLA_BUILD_LEGACY", "1") == "1"
 BUILD_DENSE_PREFILL = os.environ.get("FLASH_MLA_BUILD_DENSE_PREFILL", "0") == "1"
 
 THIS_DIR = Path(__file__).resolve().parent
+VERSION_PATH = Path("flash_mla") / "VERSION"
 
 # Stable dispatcher API shared by both build platforms. The fused kernels live
 # in their own translation unit.
@@ -300,13 +301,10 @@ def build_on_cuda_platform():
 
 
 def get_version() -> str:
-    try:
-        rev = "+" + subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], cwd=THIS_DIR, stderr=subprocess.DEVNULL
-        ).decode("ascii").rstrip()
-    except Exception:
-        rev = ""
-    return "1.0.0" + rev
+    # One source of truth, read by flash_mla.__version__ too. The release workflow
+    # overwrites it; it carries no local version segment, because PyPI rejects those
+    # and the wheel index spells the CUDA build as +cuNNN itself.
+    return (THIS_DIR / VERSION_PATH).read_text().strip()
 
 
 def main():
@@ -315,9 +313,32 @@ def main():
     print(f"Building {len(ext_modules)} extension(s): {[e.name for e in ext_modules]}")
 
     setup(
-        name="flash_mla",
+        # Distribution name; the import name stays `flash_mla`, so that downstream
+        # code reads the same either way. Mirrors sgl-deep-gemm / deep_gemm.
+        name="sgl-flash-mla",
         version=get_version(),
+        description="FlashMLA attention kernels for SGLang",
+        long_description=(THIS_DIR / "README.md").read_text(),
+        long_description_content_type="text/markdown",
+        url="https://github.com/sgl-project/FlashMLA",
+        license="MIT",
+        license_files=["LICENSE"],
+        classifiers=[
+            "Programming Language :: Python :: 3",
+            "License :: OSI Approved :: MIT License",
+            "Environment :: GPU :: NVIDIA CUDA",
+        ],
+        python_requires=">=3.10",
+        # The extensions are built against PyTorch's stable C++ ABI and hold no
+        # symbols from libtorch's C++ one, so they keep working as torch moves
+        # forward -- hence >=, not the == that SGLang and sgl-kernel pin. The
+        # floor is the version SGLang builds against and the one CI tests; the
+        # real ABI floor is 2.10 (TORCH_TARGET_VERSION), but a 2.10 wheel is
+        # cu128 and does not carry the libcudart.so.13 these extensions link,
+        # which is a runtime requirement pip cannot express.
+        install_requires=["torch>=2.14.1"],
         packages=find_packages(include=["flash_mla"]),
+        package_data={"flash_mla": [VERSION_PATH.name]},
         ext_modules=ext_modules,
         cmdclass={"build_ext": build_ext},
         options={"bdist_wheel": {"py_limited_api": "cp310"}},
