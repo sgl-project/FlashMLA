@@ -3,7 +3,8 @@ import dataclasses
 
 import torch
 
-import flash_mla.cuda as flash_mla_cuda
+# This fork builds for CUDA only; upstream's Ascend NPU target is not carried.
+from flash_mla._loader import get_ops
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
@@ -26,12 +27,14 @@ class FlashMLASchedMeta:
         extra_page_block_size: Optional[int]
         extra_topk: Optional[int]
 
+        enable_batch_invariant: bool
+
     have_initialized: bool = False
 
     config: Optional[Config] = None
 
-    tile_scheduler_metadata: Optional[torch.Tensor] = None   # (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
-    num_splits: Optional[torch.Tensor] = None                # (1), dtype torch.int32.
+    tile_scheduler_metadata: Optional[torch.Tensor] = None   # (num_sm_parts, DecodingSchedMetaSize // 4) == (num_sm_parts, 8), dtype torch.int32.
+    num_splits: Optional[torch.Tensor] = None                # (batch_size + 1), dtype torch.int32.
 
 
 def get_mla_metadata(
@@ -50,6 +53,38 @@ def get_mla_metadata(
     return FlashMLASchedMeta(), None
 
 
+def get_mla_decoding_metadata(
+    seqlens_k: torch.Tensor,
+    num_q_tokens_per_head_k: int,
+    h_k: int,
+    h_q: Optional[int] = None,
+    is_fp8_kvcache: bool = False,
+    topk: Optional[int] = None,
+    use_legacy: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Precompute the split-KV scheduling metadata, hoisted out of the decode call.
+
+    `flash_mla_with_kvcache` fills an empty `FlashMLASchedMeta` itself, which is upstream's
+    design; this is for callers that would rather hoist the scheduler out of the decode loop.
+    Assign the result onto a `FlashMLASchedMeta` to use it.
+
+    `use_legacy` has to match the decode call it will be paired with: the two schedulers agree
+    on every non-empty partition today, but that is a measurement, not a contract either side
+    makes. Dense fp8 decoding has a scheduler of its own, selected by `is_fp8_kvcache` without
+    a `topk`; it is legacy-only, like the kernel it serves.
+    """
+    ops = get_ops(use_legacy)
+    dense_fp8 = is_fp8_kvcache and topk is None
+    if dense_fp8:
+        assert use_legacy, "dense fp8 decoding exists only on the legacy side"
+        return tuple(ops.get_mla_decoding_metadata_dense_fp8(
+            seqlens_k, num_q_tokens_per_head_k, h_k
+        ))
+    return tuple(ops.get_mla_decoding_metadata(
+        seqlens_k, num_q_tokens_per_head_k, h_k, h_q, is_fp8_kvcache, topk
+    ))
+
+
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -60,57 +95,63 @@ def flash_mla_with_kvcache(
     num_splits: None = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    is_fp8_kvcache: bool = False,
+    is_fp8_kvcache: Optional[bool] = None,
     indices: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
-    kv_format: Optional[str] = None
+    enable_batch_invariant: bool = False,
+    use_legacy: bool = False,
+    kv_format: Optional[str] = None,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
-        q: (batch_size, seq_len_q, num_heads_q, head_dim).
-        k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
-                Different modes (including fp8/bf16, and sparsity) has different KV cache layouts. See comments below for details.
-                The KV cache must be contiguously valid for sparse attention on sm100. Here "contiguously valid" means that every byte, from the very beginning of the KV cache, till the last byte in the KV cache, is valid memory address to visit (i.e. won't IMA). In other words, the KV cache could be a slice of a larger array, but cannot be a list of disjoint memory blocks.
-        block_table: (batch_size, max_num_blocks_per_seq), torch.int32. Can be None when sparse attention is used.
-        cache_seqlens: (batch_size), torch.int32. Can be None when sparse attention is used.
+        q: (batch_size, seq_len_q, num_heads_q, head_dim). bfloat16. `head_dim` must be 512 and
+                `num_heads_q` must be 64 or 128.
+        k_cache: (num_blocks, page_block_size, num_heads_k, bytes_per_token).
+                dtype must be torch.float8_e4m3fn, torch.int8 or torch.uint8, and `num_heads_k`
+                must be 1 (only MQA is supported).
+                The format is detected from `bytes_per_token`; see the comments below.
+                The KV cache must be contiguously valid for sparse attention on sm100. Here "contiguously valid" means that every byte, from the very beginning of the KV cache, till the last byte in the KV cache, is valid memory address to visit (i.e. won't trigger Illegal Memory Access (IMA)). In other words, the KV cache could be a slice of a larger array, but cannot be a list of disjoint memory blocks.
+        block_table: currently ignored. We leave it here to be compatible with the old interface
+        cache_seqlens: currently ignored. We leave it here to be compatible with the old interface
         head_dim_v: Head_dim of v. Must be 512
-        sched_meta: FlashMLASchedMeta, return by get_mla_metadata. You may reuse the same sched_meta across different invocations, but only when the tensor shapes and the values of cache_seqlens, topk_length, and extra_topk_length remain the same.
-        num_splits_placeholder: must be "None" (to be compatible with the old interface).
+        tile_scheduler_metadata: FlashMLASchedMeta, returned by get_mla_metadata. You may reuse the same
+                `tile_scheduler_metadata` across different invocations, but only when the tensor shapes and the
+                values of topk_length and extra_topk_length remain the same. Note that the values are NOT
+                checked at runtime: reusing it with different `topk_length` / `extra_topk_length` values
+                silently reuses stale split-KV scheduling metadata.
+                `cache_seqlens` is not part of this contract: the decoding path ignores it.
+        num_splits: must be None (kept for compatibility with the old interface; the split counts are
+                returned inside `tile_scheduler_metadata`).
         softmax_scale: float. The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim_k).
-        causal: bool. Whether to apply causal attention mask. Only valid for dense attention
-        is_fp8_kvcache: bool.
+        causal: bool. Must be False, since only sparse attention is supported.
+        is_fp8_kvcache: optional bool. None (the default) infers it from `indices`: True for
+            sparse decoding, which supports nothing else, and False for dense decoding, which is
+            legacy-only and defaults to bf16. Pass True with `indices=None` for dense fp8.
         indices: (batch_size, seq_len_q, topk). KV indices when sparse attention is enabled.
                     Pay attention that indices_in_kvcache[i][j][k] = (the index of the page block where token t resides) * block_size + (the offset of token t among the page block),
                     where t is the k-th token of the j-th q-sequence in the i-th batch.
-        attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
+                    The decoding kernel treats an index as invalid only when it is exactly -1; it performs
+                    no upper-bound check, so any other out-of-range positive value produces out-of-bounds
+                    (TMA) addresses. Invalid entries must be set to -1.
+        attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0, while -inf has no effect.
         extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
-        kv_format: Optional[str]. Names the layout of `k_cache`: "V32", "V32_NO_ROPE", "V4" or "V41". Only needed to tell V3.2-no-RoPE and V4.1 apart, since both are 528 Bytes per token with head_dim 512. When omitted the layout is detected from the shape and 528 Bytes per token means V4.1, the same as upstream FlashMLA; pass kv_format="V32_NO_ROPE" to select the V3.2-no-RoPE layout.
-    
-    For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
-        head_dim should be 576 while head_dim_v should be 512.
-        In FP8+sparse mode, each token's KV cache is 656 Bytes, structured as:
-            - The shape of the tensor `k_cache` is (num_blocks, page_block_size, num_heads_k, head_dim), and num_heads_k must be 1.
-            - First 512 bytes: The "quantized NoPE" part, containing 512 float8_e4m3 values.
-            - Next 16 bytes: Scale factors, containing 4 float32 values. The first float32 is the scale for the first 128 float8_e4m3 values, the second for the next 128, and so on.
-            - Last 128 bytes: The "RoPE" part, containing 64 bfloat16 values. This part is not quantized for accuracy.
+        enable_batch_invariant: bool. If True, the split-KV decoding path is disabled so that results do
+                not depend on how the batch is partitioned (`enable_batch_invariant=True` on the first
+                invocation must be kept on every reuse of the same `tile_scheduler_metadata`).
 
-    For DeepSeek V3.2 without RoPE ("V32_NO_ROPE"):
-        head_dim and head_dim_v should both be 512.
-        In FP8+sparse mode, each token's KV cache is 528 Bytes, structured as the first 528 Bytes of the V3.2 layout above:
-        512 float8_e4m3 NoPE values followed by 4 float32 scale factors, and no RoPE part.
-
-    For DeepSeek V4 and DeepSeek V4.1:
+    For DeepSeek V4.1:
         head_dim should be 512 while head_dim_v should be 512.
-        In FP8+sparse mode, the format is detected from the last dimension of `k_cache` (i.e. the bytes per token): 584 (V4), 528 (V4.1) or 288 (V4.1 with an fp4 extra cache).
-        In all three, a page block stores `page_block_size` data rows first and `page_block_size` scale rows afterwards, so the scale factors are not interleaved into the data rows:
-            - V4 (584 Bytes per token): the data row is 448 float8_e4m3 NoPE values followed by 64 bfloat16 RoPE values (not quantized); the scale row is 8 Bytes, of which the first 7 are float8_e8m0 scales (the 8th byte is padding), each covering 64 consecutive float8_e4m3 values of the NoPE part.
-            - V4.1 (528 Bytes per token): the data row is 512 float8_e4m3 values (the 64 RoPE dimensions are quantized as well, so there is no bfloat16 part); the scale row is 16 Bytes of float8_e8m0 scales, each covering 32 consecutive float8_e4m3 values.
-            - V4.1 fp4 (288 Bytes per token): only valid for `extra_k_cache`, and only when `k_cache` is in the V4.1 format; the data row is 256 Bytes containing 512 e2m1 values (2 values per byte, the even-indexed one in the low nibble), and the scale row is 32 Bytes of float8_e4m3 scales, each covering 16 consecutive e2m1 values.
+        The format is detected from the last dimension of `k_cache` (i.e. the bytes per token): 528 (V4.1 fp8) or 288 (V4.1 fp4, only valid for an extra cache next to a V4.1 fp8 main cache).
+        In both, each token stores its quantized raw data first, followed immediately by its scales:
+            - V4.1 (528 Bytes per token): the raw data is 512 float8_e4m3 values, i.e. all 512 dimensions are quantized, including the 64 RoPE ones, so there is no bfloat16 part; the trailing scales are 16 Bytes of float8_e8m0 values, each covering 32 consecutive float8_e4m3 values.
+            - V4.1 fp4 (288 Bytes per token): the raw data is 256 Bytes containing 512 e2m1 values (2 values per byte, the even-indexed one in the low nibble); the trailing scales are 32 Bytes of float8_e4m3 values, each covering 16 consecutive e2m1 values.
         See tests/quant.py for quantization and dequantization details.
 
     Return:
@@ -121,33 +162,74 @@ def flash_mla_with_kvcache(
     indices_in_kvcache = indices
     assert isinstance(sched_meta, FlashMLASchedMeta), "tile_scheduler_metadata must be of type FlashMLASchedMeta"
     assert num_splits is None, "num_splits must be None"
+    ops = get_ops(use_legacy)
+    if is_fp8_kvcache is None:
+        # Upstream defaults this to True, which is right for a build that has only the sparse
+        # fp8 kernels. Dense bf16 decoding is back on the legacy side, and it is the one caller
+        # that wants False, so the default is inferred from `indices` rather than fixed.
+        is_fp8_kvcache = indices_in_kvcache is not None
 
-    topk = indices_in_kvcache.shape[-1] if indices_in_kvcache is not None else None
+    if indices_in_kvcache is None:
+        # Dense MLA decoding. Upstream deleted it in the 2026.09.30 release, so it exists only on
+        # the legacy side, where it is also the reason SM90 is still built.
+        assert use_legacy, (
+            "Sparse attention is required: `indices` must be provided. Dense MLA decoding was "
+            "removed from the current kernels; pass use_legacy=True to reach the legacy one"
+        )
+        assert kv_format is None, "kv_format does not apply to dense decoding"
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        if is_fp8_kvcache:
+            # The fork's own SM90 extension. Its scheduler is a different op, and it wants the
+            # buffers up front rather than allocating them, so they are not optional here.
+            assert sched_meta.tile_scheduler_metadata is not None, (
+                "dense fp8 decoding needs metadata from get_mla_decoding_metadata(..., "
+                "is_fp8_kvcache=True, use_legacy=True) before the first call"
+            )
+            out, lse = ops.fwd_kvcache_mla_fp8(
+                q, k_cache, head_dim_v, cache_seqlens, block_table, softmax_scale, causal,
+                sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
+                descale_q, descale_k,
+            )
+            return (out, lse)
+        assert descale_q is None and descale_k is None, (
+            "descale_q/descale_k apply to the dense fp8 path only"
+        )
+        out, lse, new_meta, new_splits = ops.dense_decode_fwd(
+            q, k_cache, head_dim_v, cache_seqlens, block_table, softmax_scale, causal,
+            sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
+        )
+        sched_meta.tile_scheduler_metadata = new_meta
+        sched_meta.num_splits = new_splits
+        return (out, lse)
+
+    assert not causal, "causal must be False when sparse attention is enabled"
+    assert is_fp8_kvcache, "is_fp8_kvcache must be True, since only sparse attention with a quantized KV cache is supported"
+
+    topk = indices_in_kvcache.shape[-1]
     extra_k_page_block_size = extra_k_cache.shape[1] if extra_k_cache is not None else None
     extra_topk = extra_indices_in_kvcache.shape[-1] if extra_indices_in_kvcache is not None else None
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
     if not sched_meta.have_initialized:
-        # Sanity check. We only perform sanity check during the first invocation to save CPU time.
-        if indices_in_kvcache is not None:
-            assert not causal, "causal must be False when indices_in_kvcache is not None (i.e. sparse attention is enabled)"
-            
         # Initialize the tile scheduler metadata during the first invocation.
         sched_meta.have_initialized = True
         sched_meta.config = FlashMLASchedMeta.Config(
-            q.shape[0],
-            q.shape[1],
-            q.shape[2],
-            k_cache.shape[1],
-            k_cache.shape[2],
+            b=q.shape[0],
+            s_q=q.shape[1],
+            h_q=q.shape[2],
+            page_block_size=k_cache.shape[1],
+            h_k=k_cache.shape[2],
 
-            causal,
-            is_fp8_kvcache,
-            topk,
+            causal=causal,
+            is_fp8_kvcache=is_fp8_kvcache,
+            topk=topk,
 
-            extra_k_page_block_size,
-            extra_topk,
+            extra_page_block_size=extra_k_page_block_size,
+            extra_topk=extra_topk,
+
+            enable_batch_invariant=enable_batch_invariant,
         )
     else:
         # Check whether the input arguments are consistent with sched_meta
@@ -160,29 +242,31 @@ def flash_mla_with_kvcache(
         assert sched_meta.config.h_k == k_cache.shape[2], "sched_meta.config.h_k must be equal to num_heads_k." + helper_msg
         assert sched_meta.config.causal == causal, "sched_meta.config.causal must be equal to causal." + helper_msg
         assert sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, "sched_meta.config.is_fp8_kvcache must be equal to is_fp8_kvcache." + helper_msg
+        assert sched_meta.config.enable_batch_invariant == enable_batch_invariant, "sched_meta.config.enable_batch_invariant must be equal to enable_batch_invariant." + helper_msg
         assert sched_meta.config.topk == topk, "sched_meta.config.topk must be equal to the last dim of indices_in_kvcache." + helper_msg
         assert sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg
         assert sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg
 
-    if topk is not None:
-        # Sparse attention
-        assert not causal, "causal must be False when sparse attention is enabled"
-        assert is_fp8_kvcache, "is_fp8_kvcache must be True when sparse attention is enabled"
-        out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.sparse_decode_fwd(
+    if use_legacy:
+        assert not enable_batch_invariant, (
+            "enable_batch_invariant is a 2026.09.30 feature and only exists on the current kernels"
+        )
+        out, lse, new_tile_scheduler_metadata, new_num_splits = ops.sparse_decode_fwd(
             q, k_cache, indices_in_kvcache, topk_length, attn_sink,
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
             extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
             head_dim_v, softmax_scale, kv_format
         )
     else:
-        # Dense attention
-        assert indices_in_kvcache is None and attn_sink is None and extra_k_cache is None and extra_indices_in_kvcache is None and topk_length is None and extra_topk_length is None, "indices_in_kvcache, attn_sink, extra_k_cache, extra_indices_in_kvcache, topk_length and extra_topk_length must be None when dense attention is used."
-        assert block_table is not None and cache_seqlens is not None, "block_table and cache_seqlens must be provided when dense attention is used."
-        out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.dense_decode_fwd(
-            q, k_cache, head_dim_v,
-            cache_seqlens, block_table,
-            softmax_scale, causal,
-            sched_meta.tile_scheduler_metadata, sched_meta.num_splits
+        assert kv_format is None, (
+            "kv_format only applies to the legacy kernels: the current ones accept the V4.1 "
+            "formats only, so there is nothing to disambiguate"
+        )
+        out, lse, new_tile_scheduler_metadata, new_num_splits = ops.sparse_decode_fwd(
+            q, k_cache, indices_in_kvcache, topk_length, attn_sink,
+            sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
+            extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
+            head_dim_v, softmax_scale, enable_batch_invariant
         )
     sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
     sched_meta.num_splits = new_num_splits
@@ -197,13 +281,14 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    use_legacy: bool = False,
     return_log2_lse: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Sparse attention prefill kernel
 
     Args:
-        q: [s_q, h_q, d_qk], bfloat16
+        q: [s_q, h_q, d_qk], bfloat16. `d_qk` must be 512 and `h_q` must be 64 or 128.
         kv: [s_kv, h_kv, d_qk], bfloat16
         indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
         sm_scale: float
@@ -214,25 +299,38 @@ def flash_mla_sparse_fwd(
             This argument has no effect on lse and max_logits.
         topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k/v tokens (even if provided in indices).
             In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
-        return_log2_lse: None (default) preserves natural-log max_logits and lse.
-            True returns both statistics in base-2 units. False skips statistics
-            allocation and stores, returning None for max_logits and lse.
-            Unlike this native API, the SGL compatibility binding defaults to
-            True to preserve its existing base-2 contract. Output is unchanged.
+        return_log2_lse: optional. None (the default) returns both statistics in natural-log
+            units; False returns None for both; True has the kernel emit them in base 2 and is
+            legacy-only. The output is the same either way.
+            False is a saving only on the legacy side, where the kernel then skips allocating and
+            writing the statistics; the current kernels always write them, so there it only hides
+            them to keep the signature uniform.
 
     Returns:
         (output, max_logits, lse)
         Please refer to tests/ref.py for the precise definitions of these parameters.
         - output: [s_q, h_q, d_v], bfloat16
-        - max_logits: [s_q, h_q], float, or None when return_log2_lse is False
-        - lse: [s_q, h_q], float, log-sum-exp of attention scores, or None
-            when return_log2_lse is False. Statistics use natural-log units for
-            None and base-2 units for True.
+        - max_logits:  [s_q, h_q], float, or None when return_log2_lse is False
+        - lse: [s_q, h_q], float, log-sum-exp of attention scores, or None when
+            return_log2_lse is False
     """
-    results = flash_mla_cuda.sparse_prefill_fwd(
-        q, kv, indices, sm_scale, d_v, attn_sink, topk_length, return_log2_lse
+    ops = get_ops(use_legacy)
+    if not use_legacy:
+        assert return_log2_lse is not True, (
+            "return_log2_lse=True is a legacy-kernel feature: the current kernels emit both "
+            "statistics in natural-log units, and converting them here would cost the launches "
+            "the kernel avoids"
+        )
+        out, max_logits, lse = ops.sparse_prefill_fwd(
+            q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+        )
+        if return_log2_lse is False:
+            return (out, None, None)
+        return (out, max_logits, lse)
+    return ops.sparse_prefill_fwd(
+        q, kv, indices, sm_scale, d_v, attn_sink, topk_length,
+        return_log2_lse is True, return_log2_lse is not False,
     )
-    return results
 
 
 def _flash_attn_varlen_forward(
@@ -249,8 +347,10 @@ def _flash_attn_varlen_forward(
     softmax_scale: Optional[float] = None,
     is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ops = get_ops(use_legacy=False)
     qo_total_len, num_qo_heads, head_dim_qk = q.shape
-    kv_total_len, num_kv_heads, head_dim_vo = v.shape
+    head_dim_vo = v.shape[-1]
+
 
     mask_mode_code = 1 if causal else 0
     if softmax_scale is None:
@@ -263,7 +363,7 @@ def _flash_attn_varlen_forward(
         lse = torch.empty(num_qo_heads, qo_total_len, device=q.device, dtype=torch.float32).T
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=q.device)
-    flash_mla_cuda.dense_prefill_fwd(
+    ops.dense_prefill_fwd(
         workspace_buffer,
         q,
         k,
@@ -300,8 +400,10 @@ def _flash_attn_varlen_backward(
     softmax_scale: Optional[float] = None,
     is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ops = get_ops(use_legacy=False)
     qo_total_len, num_qo_heads, head_dim_qk = q.shape
     kv_total_len, num_kv_heads, head_dim_vo = v.shape
+
 
     # TODO: fix bwd GQA
     if num_qo_heads != num_kv_heads:
@@ -318,15 +420,18 @@ def _flash_attn_varlen_backward(
     if dv is None:
         dv = torch.empty(kv_total_len, num_kv_heads, head_dim_vo, device=q.device, dtype=q.dtype)
 
-    max_seqlen_qo_aligned = (max_seqlen_qo + 7) // 8 * 8
+    # The C++ side takes the q length from the problem shape: `max_seqlen_qo` for variable-length
+    # batches, but `total_seqlen_q / batch_size` for fixed-length ones
+    # (csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cuh), so the workspace must be
+    # sized with that same value.
     bs = cu_seqlens_qo.shape[0] - 1
+    seqlen_qo_for_workspace = max_seqlen_qo if is_varlen else qo_total_len // bs
+    max_seqlen_qo_aligned = (seqlen_qo_for_workspace + 7) // 8 * 8
     workspace_bytes = 0
     workspace_bytes += 4 * bs * max_seqlen_qo_aligned * num_qo_heads * head_dim_qk  # dQ_acc
     workspace_bytes += 4 * max_seqlen_qo_aligned * bs * num_qo_heads * 2  # sum_OdO and scaled_lse
-    if num_qo_heads != num_kv_heads:
-        workspace_bytes += 2 * kv_total_len * num_qo_heads * (head_dim_qk + head_dim_vo)  # dKV_acc
     workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
-    flash_mla_cuda.dense_prefill_bwd(
+    ops.dense_prefill_bwd(
         workspace_buffer,
         do,
         q,
@@ -381,7 +486,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx,
         do: torch.Tensor,
         dlse: torch.Tensor,
-    ):
+    ) -> Tuple[Optional[torch.Tensor], ...]:
         del dlse  # LSE doesn't support backward currently
         q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv = ctx.saved_tensors
         dq, dk, dv = _flash_attn_varlen_backward(
@@ -407,53 +512,43 @@ def flash_attn_varlen_func(
     deterministic: bool = False,
     is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert dropout_p == 0.0
-    assert not deterministic
+    """
+    Dense (MHA) attention forward with variable-length batching, on sm100/sm103 only.
+
+    Args:
+        q: [total_qo_tokens, num_qo_heads, head_dim_qk], bfloat16. `head_dim_qk` must be 192 or 128.
+        k: [total_kv_tokens, num_kv_heads, head_dim_qk], bfloat16.
+        v: [total_kv_tokens, num_kv_heads, head_dim_vo], bfloat16. `head_dim_vo` must be 128.
+            Only the (head_dim_qk, head_dim_vo) pairs (192, 128) and (128, 128) are instantiated; every
+            other pair would make the kernel return without writing the outputs.
+        cu_seqlens_qo: [batch_size + 1], int32, cumulative query sequence lengths, starting at 0 and
+            ending at total_qo_tokens.
+        cu_seqlens_kv: [batch_size + 1], int32, cumulative key/value sequence lengths.
+        max_seqlen_qo: int. Maximum query sequence length in the batch.
+        max_seqlen_kv: int. Maximum key/value sequence length in the batch.
+        dropout_p: must be 0.0 (dropout is not implemented).
+        softmax_scale: optional float. Defaults to head_dim_qk ** (-0.5).
+        causal: bool. Whether to apply a causal attention mask.
+        deterministic: must be False. The deterministic backward mode is not implemented, and the
+            backward pass does not guarantee a bitwise-reproducible dq.
+        is_varlen: bool. If True the batch is variable-length and `cu_seqlens_*`/`max_seqlen_*` are
+            used; if False the sequences are treated as being of equal length
+            (`total_tokens / batch_size`, which is what the backward pass uses internally).
+
+    Returns:
+        (out, lse)
+        - out: [total_qo_tokens, num_qo_heads, head_dim_vo], bfloat16
+        - lse: [total_qo_tokens, num_qo_heads], float32, natural log (base e), contiguous on the
+          sequence-length dimension (stride(0) == 1)
+
+    Note:
+        The backward pass supports only `num_qo_heads == num_kv_heads` (no GQA), and it requires the
+        same dtypes and head dims as the forward pass.
+    """
+    assert dropout_p == 0.0, "dropout is not supported, `dropout_p` must be 0.0"
+    assert not deterministic, "the `deterministic` flag is not supported: the deterministic backward mode is not implemented and dq is not guaranteed to be bitwise reproducible"
     return FlashAttnVarlenFunc.apply(
         q, k, v,
-        cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
-        causal, softmax_scale, is_varlen,
-    )
-
-
-def flash_attn_varlen_qkvpacked_func(
-    qkv: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
-    head_dim_qk: int,
-    dropout_p: float = 0.0,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    deterministic: bool = False,
-    is_varlen: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert dropout_p == 0.0
-    assert not deterministic
-    return FlashAttnVarlenFunc.apply(
-        qkv[:, :, :head_dim_qk], qkv[:, :, head_dim_qk:head_dim_qk * 2], qkv[:, :, head_dim_qk * 2:],
-        cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-        causal, softmax_scale, is_varlen,
-    )
-
-
-def flash_attn_varlen_kvpacked_func(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    cu_seqlens_qo: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    max_seqlen_qo: int,
-    max_seqlen_kv: int,
-    head_dim_qk: int,
-    dropout_p: float = 0.0,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    deterministic: bool = False,
-    is_varlen: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert dropout_p == 0.0
-    assert not deterministic
-    return FlashAttnVarlenFunc.apply(
-        q, kv[:, :, :head_dim_qk], kv[:, :, head_dim_qk:],
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
         causal, softmax_scale, is_varlen,
     )
