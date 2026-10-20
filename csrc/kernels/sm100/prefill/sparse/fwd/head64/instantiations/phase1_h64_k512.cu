@@ -5,4 +5,6 @@ namespace sm100::prefill::sparse_fwd::head64 {
 
 template void run_sparse_fwd_phase1_kernel<SparseAttnFwdMode::Prefill, 512>(const SparseAttnFwdParams& params);
 
+template void run_sparse_fwd_phase1_kernel<SparseAttnFwdMode::Prefill, 512, true>(const SparseAttnFwdParams& params);
+
 }

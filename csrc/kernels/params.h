@@ -173,6 +173,11 @@ struct SparseAttnFwdParams {
     // Select base-2 instead of natural-log statistics in prefill final stores.
     bool stats_in_log2 = false;
     cudaStream_t stream;
+
+    // Four 16-head queries share one index union. Each uint64 mask covers one
+    // query's membership in a 64-key tile: [s_q, topk / 64, 4].
+    const uint64_t* __restrict__ packed_mask = nullptr;
+    int packed_q_rows = 0;  // Real token count, including a partial final group.
 };
 
 // We have some kernels that implement both prefill and decode modes in a single kernel (with different template instantiations). The following enum helps to distinguish the modes.
