@@ -134,6 +134,18 @@ def build_on_cuda_platform():
     assert major > 13 or (major == 13 and minor >= 1), \
         "Compiling the kernels requires NVCC 13.1 or higher (cvt with .scaled::n2::ue8m0)."
 
+    nvcc_archs = subprocess.check_output(
+        [os.path.join(CUDA_HOME, "bin", "nvcc"), "--list-gpu-arch"], text=True
+    )
+    if "compute_107" in nvcc_archs:
+        CUDA_ARCHS.append("sm_107a")
+        LEGACY_CUDA_ARCHS.append("sm_107a")
+        subprocess.check_call([
+            sys.executable,
+            str(THIS_DIR / "scripts" / "patch_cutlass_sm107.py"),
+            str(THIS_DIR / "csrc" / "3rdparty" / "cutlass" / "include"),
+        ])
+
     class BuildExtensionWithPostActions(BuildExtension):
         """
         Run the register-spill check after building.
