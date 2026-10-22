@@ -140,11 +140,6 @@ def build_on_cuda_platform():
     if "compute_107" in nvcc_archs:
         CUDA_ARCHS.append("sm_107a")
         LEGACY_CUDA_ARCHS.append("sm_107a")
-        subprocess.check_call([
-            sys.executable,
-            str(THIS_DIR / "scripts" / "patch_cutlass_sm107.py"),
-            str(THIS_DIR / "csrc" / "3rdparty" / "cutlass" / "include"),
-        ])
 
     class BuildExtensionWithPostActions(BuildExtension):
         """
