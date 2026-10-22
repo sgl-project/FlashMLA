@@ -33,7 +33,7 @@ struct tmem_frg_elastic : tmem_frg_base {
   CUTE_HOST_DEVICE constexpr static auto
   make(TmemShape const& tmem_shape)
   {
-    CUTE_STATIC_ASSERT_V(size(tmem_shape)*Int<int(sizeof_bits_v<StorageType>)>{} <= TMEM::MAX_CAPACITY_BITS{},
+    CUTE_STATIC_ASSERT_V(size(tmem_shape)*Int<int(sizeof_bits_v<StorageType>)>{} <= Int<TMEM::TargetTmemCapacityBits>{},
                         "Requesting more TMEM than is available.");
     CUTE_STATIC_ASSERT_V(rank<0>(tmem_shape) == Int<2>{}, "Expected post-partitioned shape ((M_MMA,N_MMA),...).");
     constexpr int R     = decltype(rank(tmem_shape))::value;
