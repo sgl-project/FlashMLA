@@ -1221,38 +1221,35 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
 
             do {
                 if constexpr (!IS_DECODE) {
-                    auto body = [&]<bool CHECK_TOPK_SUBSCRIPT>() {
-                        CUTE_NO_UNROLL
-                        for (uint32_t kv_block_idx = 0; kv_block_idx < cur_job.num_kv_blocks; ++kv_block_idx) {
-                            auto [indices_buf_idx, indices_bar_phase] = rs.get<NUM_INDICES_BUFS>();
-                            smem.bar_indices_empty[indices_buf_idx].wait(indices_bar_phase^1);
+                    CUTE_NO_UNROLL
+                    for (uint32_t kv_block_idx = 0; kv_block_idx < cur_job.num_kv_blocks; ++kv_block_idx) {
+                        auto [indices_buf_idx, indices_bar_phase] = rs.get<NUM_INDICES_BUFS>();
+                        smem.bar_indices_empty[indices_buf_idx].wait(indices_bar_phase^1);
 
-                            CUTE_UNROLL
-                            for (uint32_t i = 0; i < NUM_INDICES_PER_THREAD; ++i) {
-                                uint32_t pos = kv_block_idx * B_TOPK + i * 32 + lane_idx;
-                                int cur_index;
-                                if constexpr (CHECK_TOPK_SUBSCRIPT) {
-                                    // Predicate the load on `pos < topk_length` to prevent IMA
-                                    cur_index = pos < cur_job.topk_length ? __ldg(params.indices + cur_job.s_q_idx * params.stride_indices_s_q + pos) : -1;
-                                } else {
-                                    // topk_length % B_TOPK == 0, so every pos is within the row
-                                    cur_index = __ldg(params.indices + cur_job.s_q_idx * params.stride_indices_s_q + pos);
-                                }
-                                bool is_index_valid = (uint32_t)cur_index < (uint32_t)params.s_kv;  // Don't need to check `index >= 0`, since if `index < 0` holds, `(uint32_t)index` must lies in 2147483648 ~ 4294967295, which is definitely greater than `params.s_kv`
-                                uint32_t mask = __ballot_sync(0xFFFFFFFF, is_index_valid);
-                                if (lane_idx == 0) {
-                                    *((uint32_t*)smem.is_k_valid[indices_buf_idx] + i) = mask;
-                                }
-                            }
-
-                            smem.bar_indices_full[indices_buf_idx].arrive();
-                            rs.update();
+                        uint32_t indices[NUM_INDICES_PER_THREAD];
+                        CUTE_UNROLL
+                        for (uint32_t i = 0; i < NUM_INDICES_PER_THREAD; ++i) {
+                            const auto pos = kv_block_idx * B_TOPK + i * 32 + lane_idx;
+                            const auto src = params.indices + cur_job.s_q_idx * params.stride_indices_s_q + pos;
+                            // Keep __ldg so that the compiler is free to hoist that before wait barrier
+                            indices[i] = static_cast<uint32_t>(pos < cur_job.topk_length ? __ldg(src) : -1);
                         }
-                    };
-                    if (cur_job.topk_length % B_TOPK == 0 && cur_job.topk_length != 0)
-                        body.template operator()<false>();
-                    else
-                        body.template operator()<true>();
+
+                        CUTE_UNROLL
+                        for (uint32_t i = 0; i < NUM_INDICES_PER_THREAD; ++i) {
+                          // Don't need to check `index >= 0`, since if `index < 0` holds
+                          // `(uint32_t)index` must lies in 2147483648 ~ 4294967295
+                          // which is definitely greater than `params.s_kv`
+                          const auto is_index_valid = indices[i] < static_cast<uint32_t>(params.s_kv);
+                          const auto mask = __ballot_sync(0xFFFFFFFF, is_index_valid);
+                          if (lane_idx == 0) {
+                              *((uint32_t*)smem.is_k_valid[indices_buf_idx] + i) = mask;
+                          }
+                        }
+
+                        smem.bar_indices_full[indices_buf_idx].arrive();
+                        rs.update();
+                    }
                 } else {
                     int *indices_base = params.indices + (int64_t)cur_job.s_q_idx * params.stride_indices_s_q;
                     int *extra_indices_base = params.extra_indices + (int64_t)cur_job.s_q_idx * params.stride_extra_indices_s_q;
