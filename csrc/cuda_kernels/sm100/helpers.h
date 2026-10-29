@@ -80,10 +80,6 @@ ku::nvbf16x2 fp8x2_to_bf16x2(ku::nve4m3x2 data) {
 CUTE_DEVICE
 ku::nvbf16x2 fp8x2_to_bf16x2_with_scale(ku::nve4m3x2 data, __nv_fp8_e8m0 scale_e8m0) {
 #if SM100_HAS_NATIVE_BF16X2_CVT
-    // The second operand is a ue8m0x2: its low byte scales the low element, its high byte the high one,
-    // so the single scale is duplicated into both. The duplication is loop-invariant over a quantization
-    // chunk and hoists out of the dequant loop; what is left per pair is the one F2FP the unscaled
-    // conversion would cost anyway.
     const uint16_t packed_scale = (uint16_t)(*(uint8_t*)&scale_e8m0) * 0x0101;
     uint32_t out;
     asm("cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 %0, %1, %2;"
