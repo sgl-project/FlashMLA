@@ -76,22 +76,16 @@ ku::nvbf16x2 fp8x2_to_bf16x2(ku::nve4m3x2 data) {
     return *(ku::nvbf16x2*)&out;
 }
 
-// 1x ue8m0 scale -> 2x bf16 (the same scale in both halves)
-CUTE_DEVICE
-ku::nvbf16x2 ue8m0_to_bf16x2(__nv_fp8_e8m0 scale_e8m0) {
-    uint16_t packed = (uint16_t)(*(uint8_t*)&scale_e8m0) * 0x0101;
-    uint32_t out;
-    asm("cvt.rn.bf16x2.ue8m0x2 %0, %1;"
-        : "=r"(out)
-        : "h"(packed));
-    return *(ku::nvbf16x2*)&out;
-}
-
 // 2x fp8_e4m3 -> 2x bf16, multiplied by an ue8m0 scale
 CUTE_DEVICE
 ku::nvbf16x2 fp8x2_to_bf16x2_with_scale(ku::nve4m3x2 data, __nv_fp8_e8m0 scale_e8m0) {
 #if SM100_HAS_NATIVE_BF16X2_CVT
-    return __hmul2(fp8x2_to_bf16x2(data), ue8m0_to_bf16x2(scale_e8m0));
+    const uint16_t packed_scale = (uint16_t)(*(uint8_t*)&scale_e8m0) * 0x0101;
+    uint32_t out;
+    asm("cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 %0, %1, %2;"
+        : "=r"(out)
+        : "h"(*(uint16_t*)&data), "h"(packed_scale));
+    return *(ku::nvbf16x2*)&out;
 #else
     // The whole data path plus the scale's own conversion and the multiply form one asm block, so the
     // intermediate f16x2/bf16x2 values are invisible to the compiler instead of being live across the
