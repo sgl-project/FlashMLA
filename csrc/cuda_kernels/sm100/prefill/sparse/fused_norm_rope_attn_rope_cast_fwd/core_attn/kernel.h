@@ -15,6 +15,8 @@ struct Config {
     ModelType EXTRA_MODEL_TYPE;    // Decode only, the format of the extra KV cache. V41 for prefill
     uint32_t H_Q;
     bool ENABLE_Q_NORM;
+    bool OVERSIZED_SMEM = false;
+    bool STAGE_Q = true;
 };
 
 // Parameters for the fused Q-b-norm + Q RoPE + Core Attention Forward (prefill/decoding) + O RoPE + O Cast kernel

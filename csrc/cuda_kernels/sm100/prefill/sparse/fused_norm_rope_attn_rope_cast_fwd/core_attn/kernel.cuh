@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <cuda_fp8.h>
 #include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/cluster_launch.hpp>
@@ -15,6 +18,7 @@
 namespace sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn {
 
 static constexpr float MAX_INIT_VAL = -1e30;
+enum class QSource { Global, LastKvSlot, HalfBuffer };
 static constexpr float O_QUANT_CLAMP_MIN_VALUE = 1e-4;
 
 #ifdef KERUTILS_ENABLE_SM103A
@@ -422,6 +426,15 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 smem.bar_wg1_past_raw[i].init(4);      // CTA-local: one elected arrive per dequant warp
             }
         }
+        if constexpr (STAGE_Q) {
+            smem.bar_q_stage_full[0].init(1);
+            smem.bar_q_stage_free[0].init(128);
+        }
+        if constexpr (STAGE_Q) {
+            smem.bar_q_half_full[0].init(1);
+            smem.bar_q_half_free[0].init(128);
+        }
+        smem.single_job = (SKIP_CLC_WHEN_SINGLE_WAVE && params.s_q * (int)CLUSTER_SIZE <= params.num_sm) ? 1u : 0u;
         fence_barrier_init();
     } else if (warp_idx == 3) {
         // Allocate TMEM
@@ -436,7 +449,6 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
     } else {
         __syncthreads();
     }
-
     struct OuterloopArgs {
         bool is_valid;
         uint32_t s_q_idx;
@@ -498,6 +510,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         return _make_outer_loop_args(0, blockIdx.x);
     };
     auto get_next_job = [&](const OuterloopArgs &cur_args) -> OuterloopArgs {
+        if (smem.single_job) {
+            return OuterloopArgs {false};
+        }
         smem.bar_clc_full.wait(cur_args.job_idx_mod_2);
         ku::CLCResult next_cta0_idx = ku::get_clc_query_response<true>(smem.clc_response_obj);
         arrive_on_cta0_barrier(smem.bar_clc_empty);
@@ -535,6 +550,21 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
           and the cos/sin of the new Q is saved to the 1st slot
         - This way, O RoPE only needs to read from the 0th slot (except for the last O)
         */
+        static constexpr uint32_t Q_TOKEN_BYTES = H_Q * D_QK * sizeof(bf16);
+        static constexpr uint32_t Q_COPY_BYTES = 16384;
+        auto copy_q = [&](uint32_t s_q_idx, uint32_t offset, uint32_t bytes, void *dst, transac_bar_t &bar) {
+            const uint8_t *src = (const uint8_t*)(params.q + (uint64_t)s_q_idx * params.stride_q_s_q) + offset;
+            bar.arrive_and_expect_tx(bytes);
+            for (uint32_t i = 0; i < bytes / Q_COPY_BYTES; ++i) {
+                cute::SM90_BULK_COPY_G2S::copy(src + i * Q_COPY_BYTES, (uint64_t*)&bar, (uint8_t*)dst + i * Q_COPY_BYTES, Q_COPY_BYTES);
+            }
+        };
+        if constexpr (STAGE_Q) {
+            static_assert(Q_TOKEN_BYTES <= sizeof(smem.kv_slots[0]) && Q_TOKEN_BYTES % (2 * Q_COPY_BYTES) == 0);
+            if (idx_in_warpgroup == 0) {
+                copy_q(blockIdx.x, 0, Q_TOKEN_BYTES, smem.kv_slots[NUM_KV_SLOTS - 1], smem.bar_q_stage_full[0]);
+            }
+        }
         cutlass::arch::warpgroup_reg_alloc<WG0_REGS>();
         // The thread's TMEM lane is 32 * warp + lane; the 128 lanes are FOLD_FACTOR groups of H_Q_PER_CTA rows (config.h). Warp w
         // belongs to lane group w / (H_Q_PER_CTA / 32) and holds the K-view of rail w / 2 of Q (groups 0 | 1 = rails 0 | 1),
@@ -550,7 +580,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             cached_sin[0] = -cached_sin[1];
         };
 
-        auto load_q_and_save_to_tmem = [&](const OuterloopArgs &cur_job) {
+        auto load_q_and_save_to_tmem = [&]<QSource Q_SRC>(const OuterloopArgs &cur_job) {
+            static constexpr bool FROM_STAGE = Q_SRC != QSource::Global;
             // A thread holds the K-view of one rail for its head: D_QK / NUM_MRGEMM_RAILS bf16
             static constexpr uint32_t NUM_CACHED_Q_BF16_PER_THREAD = D_QK / NUM_MRGEMM_RAILS;
             static constexpr uint32_t NUM_BF16_PER_LOAD = 256 / 16; // LDG 256
@@ -575,21 +606,55 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             // inside this warpgroup's ~10k cycles of slack
             uint32_t q_load_dep = 0;
             const uint32_t q_zero = cur_job.topk_length >> 31;   // topk_length < 2^31, so 0 at run time; a value ptxas cannot fold away
+            if constexpr (Q_SRC == QSource::LastKvSlot) {
+                smem.bar_q_stage_full[0].wait(0);
+            } else if constexpr (Q_SRC == QSource::HalfBuffer) {
+                if (idx_in_warpgroup == 0) {
+                    copy_q(cur_job.s_q_idx, Q_TOKEN_BYTES / 2, Q_TOKEN_BYTES / 2, smem.q_half_buf, smem.bar_q_half_full[0]);
+                }
+                smem.bar_q_half_full[0].wait(0);
+            }
             CUTE_UNROLL
             for (uint32_t local_tile_idx = 3; local_tile_idx != 0xFFFFFFFF; --local_tile_idx) {
                 // Rail j holds the 64-dim tiles j, j+2, j+4, j+6 (1 CTA) or the CTA's half of the dims in order (2 CTAs)
                 uint32_t tile_idx = CLUSTER_SIZE == 1 ? local_tile_idx * 2 + rail : rail * 4 + local_tile_idx;
+                if constexpr (Q_SRC == QSource::HalfBuffer) {
+                    // Local tiles 3 and 2 are the upper half of the dims, 1 and 0 the lower half
+                    static_assert(CLUSTER_SIZE == 1);
+                    if (local_tile_idx == 1) {
+                        smem.bar_q_half_free[0].arrive();
+                        if (idx_in_warpgroup == 0) {
+                            smem.bar_q_half_free[0].wait(0);
+                            copy_q(cur_job.s_q_idx, 0, Q_TOKEN_BYTES / 2, smem.q_half_buf, smem.bar_q_half_full[0]);
+                        }
+                        smem.bar_q_half_full[0].wait(1);
+                    }
+                }
                 CUTE_UNROLL
                 for (uint32_t i = 0; i < TILE_SIZE / NUM_BF16_PER_LOAD; ++i) {
                     uint32_t h_q_idx = cta_idx * H_Q_PER_CTA + idx_in_warpgroup % H_Q_PER_CTA;
                     uint32_t d_q_idx = tile_idx * TILE_SIZE + i * NUM_BF16_PER_LOAD;
-                    KU_LDG_256(
-                        q_token_base + h_q_idx * NUM_BF16_PER_LOAD + d_q_idx * H_Q + (GROUP_Q_LOADS ? q_load_dep : 0u), // always 0
-                        cached_q + local_tile_idx * TILE_SIZE + i * NUM_BF16_PER_LOAD,
-                        ".nc", "no_allocate", "evict_first", "256B"
-                    );
+                    if constexpr (FROM_STAGE) {
+                        // Lane bit 2 picks which 16 B half of the head is read first, so a quarter warp covers 128 distinct bank bytes
+                        const bf16 *stage = Q_SRC == QSource::LastKvSlot ? (const bf16*)smem.kv_slots[NUM_KV_SLOTS - 1]
+                                                                        : (const bf16*)smem.q_half_buf;
+                        const uint32_t d_stage_idx = d_q_idx - (Q_SRC == QSource::HalfBuffer && local_tile_idx >= 2 ? D_QK / 2 : 0);
+                        const bf16 *src = stage + h_q_idx * NUM_BF16_PER_LOAD + d_stage_idx * H_Q;
+                        const bool swap = (lane_idx >> 2) & 1;
+                        uint4 first = *(const uint4*)(src + (swap ? 8 : 0));
+                        uint4 second = *(const uint4*)(src + (swap ? 0 : 8));
+                        uint4 *dst = (uint4*)(cached_q + local_tile_idx * TILE_SIZE + i * NUM_BF16_PER_LOAD);
+                        dst[0] = swap ? second : first;
+                        dst[1] = swap ? first : second;
+                    } else {
+                        KU_LDG_256(
+                            q_token_base + h_q_idx * NUM_BF16_PER_LOAD + d_q_idx * H_Q + (GROUP_Q_LOADS ? q_load_dep : 0u), // always 0
+                            cached_q + local_tile_idx * TILE_SIZE + i * NUM_BF16_PER_LOAD,
+                            ".nc", "no_allocate", "evict_first", "256B"
+                        );
+                    }
                 }
-                if constexpr (GROUP_Q_LOADS) {
+                if constexpr (GROUP_Q_LOADS && !FROM_STAGE) {
                     uint32_t tile_words = 0;
                     CUTE_UNROLL
                     for (uint32_t i = 0; i < TILE_SIZE / NUM_BF16_PER_LOAD; ++i) {
@@ -622,6 +687,14 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 }
             }
 
+            if constexpr (Q_SRC == QSource::LastKvSlot) {
+                smem.bar_q_stage_free[0].arrive();
+            } else if constexpr (Q_SRC == QSource::HalfBuffer) {
+                smem.bar_q_half_free[0].arrive();
+                if (idx_in_warpgroup == 0) {
+                    smem.bar_q_half_free[0].wait(1);
+                }
+            }
             smem.bar_tQ_empty.wait(cur_job.job_idx_mod_2^1);
             ku::tcgen05_after_thread_sync();
             
@@ -868,12 +941,12 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         };
 
         OuterloopArgs cur_job = get_first_job();
-        load_q_and_save_to_tmem(cur_job);
+        load_q_and_save_to_tmem.template operator()<STAGE_Q ? QSource::LastKvSlot : QSource::Global>(cur_job);
         do {
             OuterloopArgs next_job = get_next_job(cur_job);
             shift_cached_cos_and_cached_sin();
             if (next_job.is_valid) {
-                load_q_and_save_to_tmem(next_job);
+                load_q_and_save_to_tmem.template operator()<STAGE_Q ? QSource::HalfBuffer : QSource::Global>(next_job);
             }
             store_o(cur_job, !next_job.is_valid);
             cur_job = next_job;
@@ -1188,7 +1261,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         } else if (warp_idx == 9 && elect_one_sync()) {
             // CLC warp
             bool phase = 0;
-            while (true) {
+            while (!smem.single_job) {
                 if (cta_idx == 0) {
                     smem.bar_clc_empty.wait(phase^1);
                     ku::issue_clc_query_multicast_cluster_all(smem.bar_clc_full, smem.clc_response_obj);
@@ -1374,6 +1447,12 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     uint32_t raw_buf = rs.get<NUM_RAW_BARS>().first;
                     auto [kv_slot_idx, kv_bar_phase] = rs.get<NUM_KV_SLOTS>();
                     smem.bar_kv_slot_empty[kv_slot_idx].wait(kv_bar_phase^1);
+                    if constexpr (STAGE_Q) {
+                        // The last slot holds the first job's Q until WG0 has read it
+                        if (kv_slot_idx == NUM_KV_SLOTS - 1) {
+                            smem.bar_q_stage_free[0].wait(0);
+                        }
+                    }
                     auto [indices_buf_idx, indices_bar_phase] = rs.get<NUM_INDICES_BUFS>();
                     smem.bar_indices_full[indices_buf_idx].wait(indices_bar_phase);
                     uint8_t *slot_base = (uint8_t*)smem.kv_slots[kv_slot_idx];
@@ -1580,6 +1659,12 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
 template<typename Kernel>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, Kernel::CLUSTER_SIZE)
 fwd_kernel(__grid_constant__ const typename Kernel::Params params, __grid_constant__ const typename Kernel::TMAParams tma_params, __grid_constant__ const typename Kernel::AuxParams aux_params) {
+#if !defined(CUTLASS_ARCH_MMA_SM107A_ENABLED) && !defined(CUTLASS_ARCH_MMA_SM107F_ENABLED)
+    // Never launched: run() checks binaryVersion first
+    if constexpr (Kernel::OVERSIZED_SMEM) {
+        return;
+    }
+#endif
     Kernel::devfunc(params, tma_params, aux_params);
 }
 
@@ -1657,6 +1742,28 @@ void Kernel<CONFIG>::run(const Params &params) {
 
     auto kernel = &fwd_kernel<Kernel>;
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+    if constexpr (OVERSIZED_SMEM) {
+#if CUDART_VERSION >= 13040
+        cudaLaunchAttribute attrs[2];
+        attrs[0].id = cudaLaunchAttributeClusterDimension;
+        attrs[0].val.clusterDim.x = CLUSTER_SIZE;
+        attrs[0].val.clusterDim.y = 1;
+        attrs[0].val.clusterDim.z = 1;
+        attrs[1].id = cudaLaunchAttributeSharedMemoryMode;
+        attrs[1].val.sharedMemoryMode = cudaSharedMemoryModeAllowOversizedSharedMemory;
+        cudaLaunchConfig_t launch_config = {};
+        launch_config.gridDim = dim3(params.s_q * CLUSTER_SIZE, 1, 1);
+        launch_config.blockDim = dim3(NUM_THREADS, 1, 1);
+        launch_config.dynamicSmemBytes = smem_size;
+        launch_config.stream = params.stream;
+        launch_config.attrs = attrs;
+        launch_config.numAttrs = 2;
+        KU_CUDA_CHECK(cudaLaunchKernelEx(&launch_config, kernel, params, tma_params, aux_params));
+#else
+        KU_ASSERT(false, "Oversized shared memory requires CUDA 13.4");
+#endif
+        return;
+    }
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     cutlass::ClusterLaunchParams launch_params = {
@@ -1673,7 +1780,67 @@ void Kernel<CONFIG>::run(const Params &params) {
 
 
 template<Config CONFIG>
+bool Kernel<CONFIG>::can_use_oversized_smem() {
+#if CUDART_VERSION >= 13040
+    auto probe = [](int device) -> bool {
+        const char *disable = std::getenv("FLASH_MLA_DISABLE_OVERSIZED_SMEM");
+        if (disable != nullptr && std::strcmp(disable, "1") == 0) {
+            return false;
+        }
+        int max_oversized_smem = 0;
+        if (cudaDeviceGetAttribute(&max_oversized_smem, cudaDevAttrOversizedSharedMemoryPerBlock, device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        if ((size_t)max_oversized_smem < sizeof(SharedMemoryPlan)) {
+            return false;
+        }
+        cudaFuncAttributes func_attrs;
+        if (cudaFuncGetAttributes(&func_attrs, &fwd_kernel<Kernel>) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        return func_attrs.binaryVersion == 107;
+    };
+    static constexpr int MAX_DEVICES = 16;
+    static std::once_flag probed[MAX_DEVICES];
+    static char supported[MAX_DEVICES];
+    int device = 0;
+    KU_CUDA_CHECK(cudaGetDevice(&device));
+    if (device >= MAX_DEVICES) {
+        return false;
+    }
+    std::call_once(probed[device], [&] { supported[device] = probe(device) ? 1 : 0; });
+    return supported[device] != 0;
+#else
+    return false;
+#endif
+}
+
+
+template<Config CONFIG>
 void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>& params) {
+    if constexpr (CONFIG.FWD_MODE == SparseAttnFwdMode::Decode && CONFIG.H_Q == 64) {
+        constexpr Config OVERSIZED_CONFIG = [] {
+            Config config = CONFIG;
+            config.OVERSIZED_SMEM = true;
+            return config;
+        }();
+        constexpr Config OVERSIZED_NO_STAGE_Q_CONFIG = [](Config config) {
+            config.STAGE_Q = false;
+            return config;
+        }(OVERSIZED_CONFIG);
+        using OversizedKernelType = Kernel<OVERSIZED_CONFIG>;
+        const bool use_oversized_smem = OversizedKernelType::can_use_oversized_smem();
+        if (use_oversized_smem) {
+            if (params.s_q * (int)OversizedKernelType::CLUSTER_SIZE <= params.num_sm) {
+                Kernel<OVERSIZED_NO_STAGE_Q_CONFIG>::run(params);
+            } else {
+                OversizedKernelType::run(params);
+            }
+            return;
+        }
+    }
     using KernelType = Kernel<CONFIG>;
     KernelType::run(params);
 }
