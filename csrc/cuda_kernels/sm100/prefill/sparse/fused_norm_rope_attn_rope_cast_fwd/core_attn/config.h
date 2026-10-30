@@ -223,8 +223,6 @@ static constexpr uint32_t NUM_EPILOGUE_TILES = D_VO / FOLD_FACTOR / O_QUANT_TILE
 // pipeline concentrates into a shorter time delay that softmax block
 static constexpr uint32_t EPILOGUE_TILES_AHEAD = WIDE_WG0 ? std::min(6u, NUM_EPILOGUE_TILES) : 0;
 
-// 2-CTA: CTA1 would be left waiting on bar_clc_empty after the loop
-static constexpr bool SKIP_CLC_WHEN_SINGLE_WAVE = CLUSTER_SIZE == 1;
 static constexpr uint32_t NUM_KV_SLOTS = OVERSIZED_SMEM ? 4 : 3;
 static constexpr bool STAGE_Q = OVERSIZED_SMEM && CONFIG.STAGE_Q;
 static constexpr uint32_t NUM_INDICES_BUFS = 4;
@@ -301,8 +299,6 @@ struct SharedMemoryPlan {
     transac_bar_t bar_wg1_past_raw[IS_DECODE ? NUM_RAW_BARS : 0];
     transac_bar_t bar_q_stage_full[STAGE_Q ? 1 : 0], bar_q_stage_free[STAGE_Q ? 1 : 0];
     transac_bar_t bar_q_half_full[STAGE_Q ? 1 : 0], bar_q_half_free[STAGE_Q ? 1 : 0];
-
-    uint32_t single_job;
 
     ku::CLCResponseObj clc_response_obj;
     array_aligned<uint32_t, 1> tmem_start_addr;

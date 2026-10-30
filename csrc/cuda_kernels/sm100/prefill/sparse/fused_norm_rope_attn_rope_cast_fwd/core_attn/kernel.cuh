@@ -434,7 +434,6 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             smem.bar_q_half_full[0].init(1);
             smem.bar_q_half_free[0].init(128);
         }
-        smem.single_job = (SKIP_CLC_WHEN_SINGLE_WAVE && params.s_q * (int)CLUSTER_SIZE <= params.num_sm) ? 1u : 0u;
         fence_barrier_init();
     } else if (warp_idx == 3) {
         // Allocate TMEM
@@ -510,9 +509,6 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         return _make_outer_loop_args(0, blockIdx.x);
     };
     auto get_next_job = [&](const OuterloopArgs &cur_args) -> OuterloopArgs {
-        if (smem.single_job) {
-            return OuterloopArgs {false};
-        }
         smem.bar_clc_full.wait(cur_args.job_idx_mod_2);
         ku::CLCResult next_cta0_idx = ku::get_clc_query_response<true>(smem.clc_response_obj);
         arrive_on_cta0_barrier(smem.bar_clc_empty);
@@ -1261,7 +1257,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         } else if (warp_idx == 9 && elect_one_sync()) {
             // CLC warp
             bool phase = 0;
-            while (!smem.single_job) {
+            while (true) {
                 if (cta_idx == 0) {
                     smem.bar_clc_empty.wait(phase^1);
                     ku::issue_clc_query_multicast_cluster_all(smem.bar_clc_full, smem.clc_response_obj);
