@@ -329,7 +329,7 @@ struct DequantRows {
 template<bool MIXED_BLOCK, uint32_t NUM_GATHER_GROUPS, uint32_t RAW_KV_GROUP_BYTES>
 __device__ __forceinline__ void issue_raw_gathers(
     const int4 *coords, const uint8_t *maps_base, uint32_t map_before_split, uint32_t map_from_split, uint32_t first_extra_group,
-    transac_bar_t &bar_raw_kv_full, uint8_t *slot_base
+    transac_bar_t &bar_raw_kv_full, uint8_t *slot_base, int64_t cache_hint
 ) {
     static_assert(NUM_GATHER_GROUPS % 8 == 0);
     // One burst of code, run NUM_GATHER_GROUPS / 8 times. The front runs once per block, and the per-block code of the h128
@@ -355,7 +355,7 @@ __device__ __forceinline__ void issue_raw_gathers(
                 slot_base + g * RAW_KV_GROUP_BYTES,
                 0,
                 burst_coords[i],
-                (int64_t)TMA::CacheHintSm90::EVICT_FIRST
+                cache_hint
             );
         }
     }
@@ -1483,10 +1483,15 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                             : (cta_idx == 0 ? offsetof(TMAParams, tensor_map_extra_kv_fp8_part_cta0) : offsetof(TMAParams, tensor_map_extra_kv_fp8_part_cta1));
                         const int4 *coords = (const int4*)smem.decode_tma_coords[indices_buf_idx];
                         const uint32_t num_orig_rows = get_num_orig_rows(job, kv_block_idx);
+                        // EVICT_FIRST discards rows a later layer of the same group re-reads. Not biasing
+                        // the policy is worth ~0.8 pp at half a wave or less; above that it costs more than
+                        // it saves, so the gate is tighter than the one-wave gate used elsewhere
+                        const int64_t cache_hint = (int64_t)(params.s_q * (int)CLUSTER_SIZE * 2 <= params.num_sm
+                            ? TMA::CacheHintSm90::EVICT_NORMAL : TMA::CacheHintSm90::EVICT_FIRST);
                         if (0 < num_orig_rows && num_orig_rows < B_TOPK) {
-                            issue_raw_gathers<true, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, orig_map, extra_map, num_orig_rows / 4, smem.bar_raw_kv_full[raw_buf], slot_base);
+                            issue_raw_gathers<true, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, orig_map, extra_map, num_orig_rows / 4, smem.bar_raw_kv_full[raw_buf], slot_base, cache_hint);
                         } else {
-                            issue_raw_gathers<false, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, num_orig_rows == 0 ? extra_map : orig_map, 0, 0, smem.bar_raw_kv_full[raw_buf], slot_base);
+                            issue_raw_gathers<false, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, num_orig_rows == 0 ? extra_map : orig_map, 0, 0, smem.bar_raw_kv_full[raw_buf], slot_base, cache_hint);
                         }
                         // The raw row widths of this CTA (both caches have the same width unless the extra cache is fp4)
                         const uint32_t orig_stride = cta_idx == 0 ? KVFormatCta<MODEL_TYPE, 0>::RAW_TOKEN_SMEM_STRIDE : KVFormatCta<MODEL_TYPE, CLUSTER_SIZE - 1>::RAW_TOKEN_SMEM_STRIDE;
@@ -1824,11 +1829,17 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>
         }();
         constexpr Config OVERSIZED_NO_STAGE_Q_CONFIG = [](Config config) {
             config.STAGE_Q = false;
+            config.PIPELINED_EPILOGUE = true;
             return config;
         }(OVERSIZED_CONFIG);
         using OversizedKernelType = Kernel<OVERSIZED_CONFIG>;
         const bool use_oversized_smem = OversizedKernelType::can_use_oversized_smem();
-        if (use_oversized_smem) {
+        // A job of few KV blocks does not amortise the oversized config's heavier prologue: its 2-block
+        // kernel measures ~7% slower than the 3-slot one, so send those jobs to the 3-slot kernel
+        const int total_topk = (int)params.topk + (int)params.extra_topk;
+        const int num_kv_blocks = total_topk <= 0 ? 1
+            : (total_topk + (int)OversizedKernelType::B_TOPK - 1) / (int)OversizedKernelType::B_TOPK;
+        if (use_oversized_smem && num_kv_blocks > 3) {
             if (params.s_q * (int)OversizedKernelType::CLUSTER_SIZE <= params.num_sm) {
                 Kernel<OVERSIZED_NO_STAGE_Q_CONFIG>::run(params);
             } else {
