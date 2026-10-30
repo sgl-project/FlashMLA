@@ -172,8 +172,6 @@ static_assert(!IS_DECODE || !IS_2CTA || B_TOPK / 4 * RAW_KV_GROUP_BYTES <= SCALE
 // Prefill's code fits in the cache, and its per-job code is on the critical path between jobs, so it takes the
 // unrolled forms
 static constexpr bool COMPACT_PER_JOB_CODE = IS_DECODE;
-// Prefill: issue a job's last SV before the next job's first QK (see the MMA warp's fixed order)
-static constexpr bool BOUNDARY_SV_FIRST = !IS_DECODE;
 
 // Registers per thread of each warpgroup.
 // Decode's WG1 dequantizes a KV block in registers and needs 128. The prefill KV producer issues TMA gathers and uses
