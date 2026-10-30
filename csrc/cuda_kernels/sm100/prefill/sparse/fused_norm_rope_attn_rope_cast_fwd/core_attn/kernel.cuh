@@ -1287,6 +1287,11 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             RingBufferState rs;
             static constexpr uint32_t NUM_INDICES_PER_THREAD = B_TOPK / 32;
             static_assert(B_TOPK % 32 == 0);
+            // Decode's register-held index prefetch and the job lookahead live outside the job loop, so the
+            // last block of a job can prefetch the next job's block 0 (see JOB_PREFETCH below)
+            int prefetched[IS_DECODE ? NUM_INDICES_PER_THREAD : 1];
+            OuterloopArgs next_job{false};
+            bool prefetch_holds_next_job = false;
 
             do {
                 if constexpr (!IS_DECODE) {
@@ -1328,8 +1333,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     // per-index loop the load could not be issued early: the __ballot_sync at the end of each
                     // iteration orders the next iteration's load behind it. The prefetch resolves the source at
                     // run time (pos >= num_orig_slots holds for every KVLocation; num_orig_slots is 0xFFFFFFFF
-                    // without an extra cache); the consume side keeps the compile-time dispatch. The first block
-                    // of a job is not prefetched: its indices row is unknown until the CLC response
+                    // without an extra cache); the consume side keeps the compile-time dispatch.
                     auto load_indices = [&](uint32_t kv_block_idx, int (&dst)[NUM_INDICES_PER_THREAD]) {
                         CUTE_UNROLL
                         for (uint32_t i = 0; i < NUM_INDICES_PER_THREAD; ++i) {
@@ -1343,8 +1347,32 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                             dst[i] = local_pos < valid_len ? __ldg((in_extra ? extra_indices_base : indices_base) + local_pos) : -1;
                         }
                     };
-                    int prefetched[NUM_INDICES_PER_THREAD];
-                    load_indices(0, prefetched);
+                    // Block 0 of the next job, from that job's own row. Only the job boundary uses this form, so
+                    // the per-block path above keeps the hoisted bases and its own code
+                    [[maybe_unused]] auto load_block0_of = [&](const OuterloopArgs &job, int (&dst)[NUM_INDICES_PER_THREAD]) {
+                        int *base = params.indices + (int64_t)job.s_q_idx * params.stride_indices_s_q;
+                        int *extra_base = params.extra_indices + (int64_t)job.s_q_idx * params.stride_extra_indices_s_q;
+                        CUTE_UNROLL
+                        for (uint32_t i = 0; i < NUM_INDICES_PER_THREAD; ++i) {
+                            uint32_t pos = i * 32 + lane_idx;
+                            bool in_extra = pos >= job.num_orig_slots;
+                            uint32_t local_pos = in_extra ? pos - job.num_orig_slots : pos;
+                            uint32_t valid_len = in_extra ? job.extra_topk_length : job.topk_length;
+                            dst[i] = local_pos < valid_len ? __ldg((in_extra ? extra_base : base) + local_pos) : -1;
+                        }
+                    };
+                    // Without the lookahead, block 0 of a job cannot be prefetched: its indices row is unknown
+                    // until the CLC response, which used to arrive only at the bottom of this loop, so the gather
+                    // front waited a full index round trip at every job boundary. The next job is fetched at the
+                    // last block instead of here: at the top of the loop the CLC response for it has not been
+                    // issued yet (warp 9 issues that query only once every warp has consumed the previous one),
+                    // so waiting for it here would cost a CLC round trip to save an index one
+                    if constexpr (JOB_PREFETCH) {
+                        if (!prefetch_holds_next_job) load_indices(0, prefetched);
+                        prefetch_holds_next_job = false;
+                    } else {
+                        load_indices(0, prefetched);
+                    }
                     auto metadata_block = [&]<KVLocation LOC>(uint32_t kv_block_idx) {
                         auto [indices_buf_idx, indices_bar_phase] = rs.get<NUM_INDICES_BUFS>();
                         smem.bar_indices_empty[indices_buf_idx].wait(indices_bar_phase^1);
@@ -1353,6 +1381,15 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                         for (uint32_t i = 0; i < NUM_INDICES_PER_THREAD; ++i) cur_indices[i] = prefetched[i];
                         if (kv_block_idx + 1 < cur_job.num_kv_blocks) {
                             load_indices(kv_block_idx + 1, prefetched);
+                        } else if constexpr (JOB_PREFETCH) {
+                            // Last block of the job: consume this job's CLC response here rather than after the
+                            // loop, so the next job's block 0 indices are fetched under this block's coordinate
+                            // arithmetic and its gather. Exactly one get_next_job per job either way
+                            next_job = get_next_job(cur_job);
+                            if (next_job.is_valid) {
+                                load_block0_of(next_job, prefetched);
+                                prefetch_holds_next_job = true;
+                            }
                         }
                         // Which cache a slot of this block comes from; a compile-time constant for ORIG / EXTRA blocks
                         auto pos_in_extra = [&](uint32_t pos) {
@@ -1428,6 +1465,10 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                         for (uint32_t kv_block_idx = 0; kv_block_idx < cur_job.num_kv_blocks; ++kv_block_idx) {
                             metadata_block.template operator()<KVLocation::ORIG_AND_EXTRA>(kv_block_idx);
                         }
+                    }
+                    if constexpr (JOB_PREFETCH) {
+                        cur_job = next_job;
+                        continue;
                     }
                 }
                 cur_job = get_next_job(cur_job);
@@ -1832,6 +1873,14 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>
             config.PIPELINED_EPILOGUE = true;
             return config;
         }(OVERSIZED_CONFIG);
+        // Above one wave a CTA runs several jobs, so the index prefetch pays off across the boundary; at
+        // one job per CTA it never fires and only costs its code, hence the split by config rather than a
+        // runtime branch. Jobs of three KV blocks or fewer do not reach this kernel at all (see below),
+        // which is what keeps the SWA-only layers out: 2 blocks amortise the extra code too poorly
+        constexpr Config OVERSIZED_JOB_PREFETCH_CONFIG = [](Config config) {
+            config.JOB_PREFETCH = true;
+            return config;
+        }(OVERSIZED_CONFIG);
         using OversizedKernelType = Kernel<OVERSIZED_CONFIG>;
         const bool use_oversized_smem = OversizedKernelType::can_use_oversized_smem();
         // A job of few KV blocks does not amortise the oversized config's heavier prologue: its 2-block
@@ -1843,7 +1892,7 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>
             if (params.s_q * (int)OversizedKernelType::CLUSTER_SIZE <= params.num_sm) {
                 Kernel<OVERSIZED_NO_STAGE_Q_CONFIG>::run(params);
             } else {
-                OversizedKernelType::run(params);
+                Kernel<OVERSIZED_JOB_PREFETCH_CONFIG>::run(params);
             }
             return;
         }

@@ -174,6 +174,7 @@ static_assert(!IS_DECODE || !IS_2CTA || B_TOPK / 4 * RAW_KV_GROUP_BYTES <= SCALE
 // The pipelined epilogue needs the unrolled per-job code (see EPILOGUE_TILES_AHEAD), so compaction
 // and pipelining are mutually exclusive
 static constexpr bool PIPELINED_EPILOGUE = CONFIG.PIPELINED_EPILOGUE;
+static constexpr bool JOB_PREFETCH = IS_DECODE && CONFIG.JOB_PREFETCH;
 static constexpr bool COMPACT_PER_JOB_CODE = IS_DECODE && !PIPELINED_EPILOGUE;
 
 // Registers per thread of each warpgroup.
