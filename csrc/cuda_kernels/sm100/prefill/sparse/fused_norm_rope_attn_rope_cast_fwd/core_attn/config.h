@@ -22,6 +22,8 @@ Template parameters:
               (V4.1 with an fp4 extra KV cache, e4m3 per-16 scales); prefill passes V41
 - H_Q:        number of Q heads: 64 (1 CTA) or 128 (2-CTA cluster)
 - ENABLE_Q_NORM: the API's `enable_q_norm` flag
+- OVERSIZED_SMEM: decode with H_Q = 64 only; 4 KV slots in the oversized shared memory of CC 10.7 (up to 334848 B per block,
+              launched with the oversized shared memory mode). The kernel body is compiled for sm_107a / sm_107f only
 
 I/O (see `csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp` and the Python docstrings in
 `flash_mla/fused_norm_rope_attn_rope_cast.py` for the full parameter list):
@@ -106,6 +108,9 @@ static constexpr uint32_t D_ROPE = 64;
 static constexpr uint32_t D_NOPE = D_QK - D_ROPE;
 static constexpr uint32_t WV_GROUP_SIZE = 8;
 static constexpr bool ENABLE_Q_NORM = CONFIG.ENABLE_Q_NORM;
+static constexpr bool OVERSIZED_SMEM = CONFIG.OVERSIZED_SMEM;
+static_assert(!OVERSIZED_SMEM || (IS_DECODE && H_Q == 64));
+static constexpr uint32_t OVERSIZED_SMEM_CAPACITY = 334848;
 
 // Cluster shape selection
 static constexpr uint32_t CLUSTER_SIZE = ku::ceil_div((uint32_t)H_Q, 64u);
@@ -218,7 +223,8 @@ static constexpr uint32_t NUM_EPILOGUE_TILES = D_VO / FOLD_FACTOR / O_QUANT_TILE
 // pipeline concentrates into a shorter time delay that softmax block
 static constexpr uint32_t EPILOGUE_TILES_AHEAD = WIDE_WG0 ? std::min(6u, NUM_EPILOGUE_TILES) : 0;
 
-static constexpr uint32_t NUM_KV_SLOTS = 3;
+static constexpr uint32_t NUM_KV_SLOTS = OVERSIZED_SMEM ? 4 : 3;
+static constexpr bool STAGE_Q = OVERSIZED_SMEM && CONFIG.STAGE_Q;
 static constexpr uint32_t NUM_INDICES_BUFS = 4;
 // Raw-gather barriers: an alternating pair, so two gather batches can be issued but not completed at the same
 // time: the front of block k+1 waits for the dequant warps to be past block k-1, the previous user of
@@ -267,6 +273,7 @@ using TiledMMA_SV = cute::conditional_t<
 struct SharedMemoryPlan {
     CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
     CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
+    CUTE_ALIGNAS(128) bf16 q_half_buf[STAGE_Q ? H_Q * D_QK / 2 : 0];
     CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
     CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
     // Decode: WG10 produces metadata once for the four dequant warps. 16 B aligned so that the fp4 path can read
@@ -290,11 +297,13 @@ struct SharedMemoryPlan {
     transac_bar_t bar_raw_kv_full[IS_DECODE ? NUM_RAW_BARS : 0];
     // Dequant has passed the raw+scale completion wait; warp 11 may reuse this barrier index.
     transac_bar_t bar_wg1_past_raw[IS_DECODE ? NUM_RAW_BARS : 0];
+    transac_bar_t bar_q_stage_full[STAGE_Q ? 1 : 0], bar_q_stage_free[STAGE_Q ? 1 : 0];
+    transac_bar_t bar_q_half_full[STAGE_Q ? 1 : 0], bar_q_half_free[STAGE_Q ? 1 : 0];
 
     ku::CLCResponseObj clc_response_obj;
     array_aligned<uint32_t, 1> tmem_start_addr;
 };
-static_assert(sizeof(SharedMemoryPlan) <= 227 * 1024);
+static_assert(sizeof(SharedMemoryPlan) <= (OVERSIZED_SMEM ? OVERSIZED_SMEM_CAPACITY : 227 * 1024));
 
 struct TMAParams {
     // Prefill only
@@ -352,6 +361,8 @@ static __device__ __forceinline__ void
 devfunc(const Params &params, const TMAParams &tma_params, const AuxParams &aux_params);
 
 static void run(const Params &params);
+
+static bool can_use_oversized_smem();
 
 };
 
