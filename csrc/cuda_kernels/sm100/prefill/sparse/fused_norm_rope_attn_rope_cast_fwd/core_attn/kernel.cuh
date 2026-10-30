@@ -27,6 +27,12 @@ static constexpr bool IS_TMEM_LD_WITH_RED_AVAILABLE = true;
 static constexpr bool IS_TMEM_LD_WITH_RED_AVAILABLE = false;
 #endif
 
+#if defined(CUTLASS_ARCH_MMA_SM107A_ENABLED) || defined(CUTLASS_ARCH_MMA_SM107F_ENABLED)
+static constexpr bool IS_SM107 = true;
+#else
+static constexpr bool IS_SM107 = false;
+#endif
+
 __device__ __forceinline__
 float2 apply_rope(const float2 &x, const float &cur_cos, const float &cur_sin) {
     float2 a = {x.x, x.x};
@@ -1478,9 +1484,6 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 // alternating barrier pair (bar_wg1_past_raw), then for the block's KV slot and indices; issue the
                 // raw gather4s and CTA0 scale copies, both tracked by bar_raw_kv_full[index]
                 RingBufferState rs;
-                // VR h64 only: below half a wave a request's verify slots are concurrent CTAs that share gathered rows
-                const int64_t gather_cache_hint = (int64_t)(OVERSIZED_SMEM && params.s_q * (int)CLUSTER_SIZE * 2 <= params.num_sm
-                    ? TMA::CacheHintSm90::EVICT_NORMAL : TMA::CacheHintSm90::EVICT_FIRST);
                 auto issue_front = [&](const OuterloopArgs &job, uint32_t kv_block_idx) {
                     uint32_t raw_buf = rs.get<NUM_RAW_BARS>().first;
                     auto [kv_slot_idx, kv_bar_phase] = rs.get<NUM_KV_SLOTS>();
@@ -1525,6 +1528,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                             : (cta_idx == 0 ? offsetof(TMAParams, tensor_map_extra_kv_fp8_part_cta0) : offsetof(TMAParams, tensor_map_extra_kv_fp8_part_cta1));
                         const int4 *coords = (const int4*)smem.decode_tma_coords[indices_buf_idx];
                         const uint32_t num_orig_rows = get_num_orig_rows(job, kv_block_idx);
+                        // VR h64 only: below half a wave a request's verify slots are concurrent CTAs that share gathered rows
+                        const int64_t gather_cache_hint = (int64_t)(IS_SM107 && H_Q == 64 && params.s_q * 2 <= params.num_sm
+                            ? TMA::CacheHintSm90::EVICT_NORMAL : TMA::CacheHintSm90::EVICT_FIRST);
                         if (0 < num_orig_rows && num_orig_rows < B_TOPK) {
                             issue_raw_gathers<true, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, orig_map, extra_map, num_orig_rows / 4, smem.bar_raw_kv_full[raw_buf], slot_base, gather_cache_hint);
                         } else {
