@@ -1246,11 +1246,20 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     }
 
                     OuterloopArgs next_job = get_next_job(cur_job);
-                    if (next_job.is_valid) {
-                        run_qk_gemm(next_job, 0);
+                    // The next job's first QK waits on tQ_full, i.e. on WG0 storing its Q after this job's last QK;
+                    // issued first, it also holds back this job's last SV, its tO_full and the O epilogue
+                    if constexpr (BOUNDARY_SV_FIRST) {
+                        run_sv_gemm(cur_job, cur_job.num_kv_blocks-1);
+                        if (next_job.is_valid) {
+                            run_qk_gemm(next_job, 0);
+                        }
+                    } else {
+                        if (next_job.is_valid) {
+                            run_qk_gemm(next_job, 0);
+                        }
+                        run_sv_gemm(cur_job, cur_job.num_kv_blocks-1);
                     }
-                    run_sv_gemm(cur_job, cur_job.num_kv_blocks-1);
-                    
+
                     cur_job = next_job;
                 } while (cur_job.is_valid);
             }
