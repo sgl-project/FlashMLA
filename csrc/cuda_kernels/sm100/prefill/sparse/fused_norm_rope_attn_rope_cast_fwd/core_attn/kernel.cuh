@@ -429,8 +429,6 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         if constexpr (STAGE_Q) {
             smem.bar_q_stage_full[0].init(1);
             smem.bar_q_stage_free[0].init(128);
-        }
-        if constexpr (STAGE_Q) {
             smem.bar_q_half_full[0].init(1);
             smem.bar_q_half_free[0].init(128);
         }
@@ -1480,6 +1478,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 // alternating barrier pair (bar_wg1_past_raw), then for the block's KV slot and indices; issue the
                 // raw gather4s and CTA0 scale copies, both tracked by bar_raw_kv_full[index]
                 RingBufferState rs;
+                // VR h64 only: below half a wave a request's verify slots are concurrent CTAs that share gathered rows
+                const int64_t gather_cache_hint = (int64_t)(OVERSIZED_SMEM && params.s_q * (int)CLUSTER_SIZE * 2 <= params.num_sm
+                    ? TMA::CacheHintSm90::EVICT_NORMAL : TMA::CacheHintSm90::EVICT_FIRST);
                 auto issue_front = [&](const OuterloopArgs &job, uint32_t kv_block_idx) {
                     uint32_t raw_buf = rs.get<NUM_RAW_BARS>().first;
                     auto [kv_slot_idx, kv_bar_phase] = rs.get<NUM_KV_SLOTS>();
@@ -1524,15 +1525,10 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                             : (cta_idx == 0 ? offsetof(TMAParams, tensor_map_extra_kv_fp8_part_cta0) : offsetof(TMAParams, tensor_map_extra_kv_fp8_part_cta1));
                         const int4 *coords = (const int4*)smem.decode_tma_coords[indices_buf_idx];
                         const uint32_t num_orig_rows = get_num_orig_rows(job, kv_block_idx);
-                        // EVICT_FIRST discards rows a later layer of the same group re-reads. Not biasing
-                        // the policy is worth ~0.8 pp at half a wave or less; above that it costs more than
-                        // it saves, so the gate is tighter than the one-wave gate used elsewhere
-                        const int64_t cache_hint = (int64_t)(params.s_q * (int)CLUSTER_SIZE * 2 <= params.num_sm
-                            ? TMA::CacheHintSm90::EVICT_NORMAL : TMA::CacheHintSm90::EVICT_FIRST);
                         if (0 < num_orig_rows && num_orig_rows < B_TOPK) {
-                            issue_raw_gathers<true, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, orig_map, extra_map, num_orig_rows / 4, smem.bar_raw_kv_full[raw_buf], slot_base, cache_hint);
+                            issue_raw_gathers<true, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, orig_map, extra_map, num_orig_rows / 4, smem.bar_raw_kv_full[raw_buf], slot_base, gather_cache_hint);
                         } else {
-                            issue_raw_gathers<false, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, num_orig_rows == 0 ? extra_map : orig_map, 0, 0, smem.bar_raw_kv_full[raw_buf], slot_base, cache_hint);
+                            issue_raw_gathers<false, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, num_orig_rows == 0 ? extra_map : orig_map, 0, 0, smem.bar_raw_kv_full[raw_buf], slot_base, gather_cache_hint);
                         }
                         // The raw row widths of this CTA (both caches have the same width unless the extra cache is fp4)
                         const uint32_t orig_stride = cta_idx == 0 ? KVFormatCta<MODEL_TYPE, 0>::RAW_TOKEN_SMEM_STRIDE : KVFormatCta<MODEL_TYPE, CLUSTER_SIZE - 1>::RAW_TOKEN_SMEM_STRIDE;
@@ -1702,7 +1698,7 @@ template<typename Kernel>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, Kernel::CLUSTER_SIZE)
 fwd_kernel(__grid_constant__ const typename Kernel::Params params, __grid_constant__ const typename Kernel::TMAParams tma_params, __grid_constant__ const typename Kernel::AuxParams aux_params) {
 #if !defined(CUTLASS_ARCH_MMA_SM107A_ENABLED) && !defined(CUTLASS_ARCH_MMA_SM107F_ENABLED)
-    // Never launched: run() checks binaryVersion first
+    // Never launched: can_use_oversized_smem() checks binaryVersion first
     if constexpr (Kernel::OVERSIZED_SMEM) {
         return;
     }
@@ -1882,19 +1878,23 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>
             return config;
         }(OVERSIZED_CONFIG);
         using OversizedKernelType = Kernel<OVERSIZED_CONFIG>;
-        const bool use_oversized_smem = OversizedKernelType::can_use_oversized_smem();
-        // A job of few KV blocks does not amortise the oversized config's heavier prologue: its 2-block
-        // kernel measures ~7% slower than the 3-slot one, so send those jobs to the 3-slot kernel
-        const int total_topk = (int)params.topk + (int)params.extra_topk;
-        const int num_kv_blocks = total_topk <= 0 ? 1
-            : (total_topk + (int)OversizedKernelType::B_TOPK - 1) / (int)OversizedKernelType::B_TOPK;
-        if (use_oversized_smem && num_kv_blocks > 3) {
+        // Launches whose jobs are at most three KV blocks go to the 3-slot kernel. The count comes from the
+        // topk capacities, not the per-request lengths, so a launch of short requests still counts as long
+        const int num_kv_blocks = std::max(ku::ceil_div(params.topk + params.extra_topk, (int)OversizedKernelType::B_TOPK), 1);
+        if (num_kv_blocks > 3) {
             if (params.s_q * (int)OversizedKernelType::CLUSTER_SIZE <= params.num_sm) {
-                Kernel<OVERSIZED_NO_STAGE_Q_CONFIG>::run(params);
+                using KernelType = Kernel<OVERSIZED_NO_STAGE_Q_CONFIG>;
+                if (KernelType::can_use_oversized_smem()) {
+                    KernelType::run(params);
+                    return;
+                }
             } else {
-                Kernel<OVERSIZED_JOB_PREFETCH_CONFIG>::run(params);
+                using KernelType = Kernel<OVERSIZED_JOB_PREFETCH_CONFIG>;
+                if (KernelType::can_use_oversized_smem()) {
+                    KernelType::run(params);
+                    return;
+                }
             }
-            return;
         }
     }
     using KernelType = Kernel<CONFIG>;

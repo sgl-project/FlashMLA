@@ -17,11 +17,10 @@ struct Config {
     bool ENABLE_Q_NORM;
     bool OVERSIZED_SMEM = false;
     bool STAGE_Q = true;
-    // Software-pipeline the O epilogue. Worth 1.8-2.2 pp of the kernel at s_q 128-212 and nothing
-    // above one wave, so it rides the same gate as STAGE_Q (see run_fused_norm_rope_attn_rope_cast_fwd_kernel)
+    // Decode h64: software-pipeline the O epilogue. Set on the config the host picks at or below one wave
+    // (see run_fused_norm_rope_attn_rope_cast_fwd_kernel)
     bool PIPELINED_EPILOGUE = false;
-    // Decode: carry the index prefetch across the job boundary. Worth 2.5-3.3% of the kernel from three
-    // jobs per CTA upward and a ~0.8% loss at one, so it is set only on the config the host picks above
+    // Decode: carry the index prefetch across the job boundary. Set on the config the host picks above
     // one wave (see run_fused_norm_rope_attn_rope_cast_fwd_kernel)
     bool JOB_PREFETCH = false;
 };
