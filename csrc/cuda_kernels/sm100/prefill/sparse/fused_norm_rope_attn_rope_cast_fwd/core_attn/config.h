@@ -171,8 +171,7 @@ static_assert(!IS_DECODE || !IS_2CTA || B_TOPK / 4 * RAW_KV_GROUP_BYTES <= SCALE
 // squares) is kept small there, which adds some latency to each job: loops rolled, sums read back from TMEM.
 // Prefill's code fits in the cache, and its per-job code is on the critical path between jobs, so it takes the
 // unrolled forms
-// The pipelined epilogue needs the unrolled per-job code (see EPILOGUE_TILES_AHEAD), so compaction
-// and pipelining are mutually exclusive
+// The pipelined epilogue needs the unrolled per-job code
 static constexpr bool PIPELINED_EPILOGUE = CONFIG.PIPELINED_EPILOGUE;
 static_assert(!PIPELINED_EPILOGUE || (IS_DECODE && H_Q == 64));
 static constexpr bool JOB_PREFETCH = IS_DECODE && CONFIG.JOB_PREFETCH;
@@ -226,8 +225,7 @@ static constexpr uint32_t NUM_EPILOGUE_TILES = D_VO / FOLD_FACTOR / O_QUANT_TILE
 // load, conversion and stores per iteration. The 2-CTA prefill kernels use 0. Their first SV of a job waits on the softmax's
 // first S, and S is published later than tO_empty, so an earlier tO_empty does not start the SV earlier, while the stores the
 // pipeline concentrates into a shorter time delay that softmax block
-// Decode pipelines 3 tiles when PIPELINED_EPILOGUE is set: 3 is the deepest lookahead that fits
-// WG0's 184 registers without spilling
+// Decode: 3 is the deepest lookahead that fits WG0's registers without spilling
 static constexpr uint32_t EPILOGUE_TILES_AHEAD = WIDE_WG0 ? std::min(6u, NUM_EPILOGUE_TILES)
     : (PIPELINED_EPILOGUE ? std::min(3u, NUM_EPILOGUE_TILES) : 0);
 
