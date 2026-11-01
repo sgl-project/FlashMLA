@@ -17,6 +17,8 @@ struct Config {
     bool ENABLE_Q_NORM;
     bool OVERSIZED_SMEM = false;
     bool STAGE_Q = true;
+    bool PIPELINED_EPILOGUE = false;   // Decode h64, at most one wave: software-pipeline the O epilogue
+    bool JOB_PREFETCH = false;         // Decode, above one wave: prefetch the next job's block 0 indices
 };
 
 // Parameters for the fused Q-b-norm + Q RoPE + Core Attention Forward (prefill/decoding) + O RoPE + O Cast kernel

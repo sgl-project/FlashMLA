@@ -329,7 +329,7 @@ struct DequantRows {
 template<bool MIXED_BLOCK, uint32_t NUM_GATHER_GROUPS, uint32_t RAW_KV_GROUP_BYTES>
 __device__ __forceinline__ void issue_raw_gathers(
     const int4 *coords, const uint8_t *maps_base, uint32_t map_before_split, uint32_t map_from_split, uint32_t first_extra_group,
-    transac_bar_t &bar_raw_kv_full, uint8_t *slot_base
+    transac_bar_t &bar_raw_kv_full, uint8_t *slot_base, int64_t cache_hint
 ) {
     static_assert(NUM_GATHER_GROUPS % 8 == 0);
     // One burst of code, run NUM_GATHER_GROUPS / 8 times. The front runs once per block, and the per-block code of the h128
@@ -355,7 +355,7 @@ __device__ __forceinline__ void issue_raw_gathers(
                 slot_base + g * RAW_KV_GROUP_BYTES,
                 0,
                 burst_coords[i],
-                (int64_t)TMA::CacheHintSm90::EVICT_FIRST
+                cache_hint
             );
         }
     }
@@ -429,8 +429,6 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         if constexpr (STAGE_Q) {
             smem.bar_q_stage_full[0].init(1);
             smem.bar_q_stage_free[0].init(128);
-        }
-        if constexpr (STAGE_Q) {
             smem.bar_q_half_full[0].init(1);
             smem.bar_q_half_free[0].init(128);
         }
@@ -1294,6 +1292,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             RingBufferState rs;
             static constexpr uint32_t NUM_INDICES_PER_THREAD = B_TOPK / 32;
             static_assert(B_TOPK % 32 == 0);
+            int prefetched[IS_DECODE ? NUM_INDICES_PER_THREAD : 1];
+            OuterloopArgs next_job{false};
+            bool prefetch_holds_next_job = false;
 
             do {
                 if constexpr (!IS_DECODE) {
@@ -1335,8 +1336,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     // per-index loop the load could not be issued early: the __ballot_sync at the end of each
                     // iteration orders the next iteration's load behind it. The prefetch resolves the source at
                     // run time (pos >= num_orig_slots holds for every KVLocation; num_orig_slots is 0xFFFFFFFF
-                    // without an extra cache); the consume side keeps the compile-time dispatch. The first block
-                    // of a job is not prefetched: its indices row is unknown until the CLC response
+                    // without an extra cache); the consume side keeps the compile-time dispatch
                     auto load_indices = [&](uint32_t kv_block_idx, int (&dst)[NUM_INDICES_PER_THREAD]) {
                         CUTE_UNROLL
                         for (uint32_t i = 0; i < NUM_INDICES_PER_THREAD; ++i) {
@@ -1350,8 +1350,24 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                             dst[i] = local_pos < valid_len ? __ldg((in_extra ? extra_indices_base : indices_base) + local_pos) : -1;
                         }
                     };
-                    int prefetched[NUM_INDICES_PER_THREAD];
-                    load_indices(0, prefetched);
+                    [[maybe_unused]] auto load_block0_of = [&](const OuterloopArgs &job, int (&dst)[NUM_INDICES_PER_THREAD]) {
+                        int *base = params.indices + (int64_t)job.s_q_idx * params.stride_indices_s_q;
+                        int *extra_base = params.extra_indices + (int64_t)job.s_q_idx * params.stride_extra_indices_s_q;
+                        CUTE_UNROLL
+                        for (uint32_t i = 0; i < NUM_INDICES_PER_THREAD; ++i) {
+                            uint32_t pos = i * 32 + lane_idx;
+                            bool in_extra = pos >= job.num_orig_slots;
+                            uint32_t local_pos = in_extra ? pos - job.num_orig_slots : pos;
+                            uint32_t valid_len = in_extra ? job.extra_topk_length : job.topk_length;
+                            dst[i] = local_pos < valid_len ? __ldg((in_extra ? extra_base : base) + local_pos) : -1;
+                        }
+                    };
+                    if constexpr (JOB_PREFETCH) {
+                        if (!prefetch_holds_next_job) load_indices(0, prefetched);
+                        prefetch_holds_next_job = false;
+                    } else {
+                        load_indices(0, prefetched);
+                    }
                     auto metadata_block = [&]<KVLocation LOC>(uint32_t kv_block_idx) {
                         auto [indices_buf_idx, indices_bar_phase] = rs.get<NUM_INDICES_BUFS>();
                         smem.bar_indices_empty[indices_buf_idx].wait(indices_bar_phase^1);
@@ -1360,6 +1376,12 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                         for (uint32_t i = 0; i < NUM_INDICES_PER_THREAD; ++i) cur_indices[i] = prefetched[i];
                         if (kv_block_idx + 1 < cur_job.num_kv_blocks) {
                             load_indices(kv_block_idx + 1, prefetched);
+                        } else if constexpr (JOB_PREFETCH) {
+                            next_job = get_next_job(cur_job);
+                            if (next_job.is_valid) {
+                                load_block0_of(next_job, prefetched);
+                                prefetch_holds_next_job = true;
+                            }
                         }
                         // Which cache a slot of this block comes from; a compile-time constant for ORIG / EXTRA blocks
                         auto pos_in_extra = [&](uint32_t pos) {
@@ -1436,6 +1458,10 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                             metadata_block.template operator()<KVLocation::ORIG_AND_EXTRA>(kv_block_idx);
                         }
                     }
+                    if constexpr (JOB_PREFETCH) {
+                        cur_job = next_job;
+                        continue;
+                    }
                 }
                 cur_job = get_next_job(cur_job);
             } while (cur_job.is_valid);
@@ -1490,10 +1516,13 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                             : (cta_idx == 0 ? offsetof(TMAParams, tensor_map_extra_kv_fp8_part_cta0) : offsetof(TMAParams, tensor_map_extra_kv_fp8_part_cta1));
                         const int4 *coords = (const int4*)smem.decode_tma_coords[indices_buf_idx];
                         const uint32_t num_orig_rows = get_num_orig_rows(job, kv_block_idx);
+                        // Below half a wave a request's verify slots run concurrently and share gathered rows
+                        const int64_t gather_cache_hint = (int64_t)(H_Q == 64 && params.s_q * 2 <= params.num_sm
+                            ? TMA::CacheHintSm90::EVICT_NORMAL : TMA::CacheHintSm90::EVICT_FIRST);
                         if (0 < num_orig_rows && num_orig_rows < B_TOPK) {
-                            issue_raw_gathers<true, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, orig_map, extra_map, num_orig_rows / 4, smem.bar_raw_kv_full[raw_buf], slot_base);
+                            issue_raw_gathers<true, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, orig_map, extra_map, num_orig_rows / 4, smem.bar_raw_kv_full[raw_buf], slot_base, gather_cache_hint);
                         } else {
-                            issue_raw_gathers<false, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, num_orig_rows == 0 ? extra_map : orig_map, 0, 0, smem.bar_raw_kv_full[raw_buf], slot_base);
+                            issue_raw_gathers<false, B_TOPK / 4, RAW_KV_GROUP_BYTES>(coords, maps_base, num_orig_rows == 0 ? extra_map : orig_map, 0, 0, smem.bar_raw_kv_full[raw_buf], slot_base, gather_cache_hint);
                         }
                         // The raw row widths of this CTA (both caches have the same width unless the extra cache is fp4)
                         const uint32_t orig_stride = cta_idx == 0 ? KVFormatCta<MODEL_TYPE, 0>::RAW_TOKEN_SMEM_STRIDE : KVFormatCta<MODEL_TYPE, CLUSTER_SIZE - 1>::RAW_TOKEN_SMEM_STRIDE;
@@ -1663,7 +1692,7 @@ template<typename Kernel>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, Kernel::CLUSTER_SIZE)
 fwd_kernel(__grid_constant__ const typename Kernel::Params params, __grid_constant__ const typename Kernel::TMAParams tma_params, __grid_constant__ const typename Kernel::AuxParams aux_params) {
 #if !defined(CUTLASS_ARCH_MMA_SM107A_ENABLED) && !defined(CUTLASS_ARCH_MMA_SM107F_ENABLED)
-    // Never launched: run() checks binaryVersion first
+    // Never launched: can_use_oversized_smem() checks binaryVersion first
     if constexpr (Kernel::OVERSIZED_SMEM) {
         return;
     }
@@ -1831,17 +1860,30 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>
         }();
         constexpr Config OVERSIZED_NO_STAGE_Q_CONFIG = [](Config config) {
             config.STAGE_Q = false;
+            config.PIPELINED_EPILOGUE = true;
+            return config;
+        }(OVERSIZED_CONFIG);
+        constexpr Config OVERSIZED_JOB_PREFETCH_CONFIG = [](Config config) {
+            config.JOB_PREFETCH = true;
             return config;
         }(OVERSIZED_CONFIG);
         using OversizedKernelType = Kernel<OVERSIZED_CONFIG>;
-        const bool use_oversized_smem = OversizedKernelType::can_use_oversized_smem();
-        if (use_oversized_smem) {
+        // Jobs of at most three KV blocks (by topk capacity, not per-request length) use the 3-slot kernel
+        const int num_kv_blocks = std::max(ku::ceil_div(params.topk + params.extra_topk, (int)OversizedKernelType::B_TOPK), 1);
+        if (num_kv_blocks > 3) {
             if (params.s_q * (int)OversizedKernelType::CLUSTER_SIZE <= params.num_sm) {
-                Kernel<OVERSIZED_NO_STAGE_Q_CONFIG>::run(params);
+                using KernelType = Kernel<OVERSIZED_NO_STAGE_Q_CONFIG>;
+                if (KernelType::can_use_oversized_smem()) {
+                    KernelType::run(params);
+                    return;
+                }
             } else {
-                OversizedKernelType::run(params);
+                using KernelType = Kernel<OVERSIZED_JOB_PREFETCH_CONFIG>;
+                if (KernelType::can_use_oversized_smem()) {
+                    KernelType::run(params);
+                    return;
+                }
             }
-            return;
         }
     }
     using KernelType = Kernel<CONFIG>;
