@@ -22,8 +22,9 @@ Template parameters:
               (V4.1 with an fp4 extra KV cache, e4m3 per-16 scales); prefill passes V41
 - H_Q:        number of Q heads: 64 (1 CTA) or 128 (2-CTA cluster)
 - ENABLE_Q_NORM: the API's `enable_q_norm` flag
-- OVERSIZED_SMEM: decode with H_Q = 64 only; 4 KV slots in the oversized shared memory of CC 10.7 (up to 334848 B per block,
-              launched with the oversized shared memory mode). The kernel body is compiled for sm_107a / sm_107f only
+- OVERSIZED_SMEM: H_Q = 64 only; 4 KV slots in the oversized shared memory of CC 10.7 (up to 334848 B per block,
+              launched with the oversized shared memory mode). The kernel body is compiled for sm_107a / sm_107f only.
+              Prefill uses it at s_q >= 16 * num_sm, with every job's Q TMA-staged through q_half_buf
 
 I/O (see `csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp` and the Python docstrings in
 `flash_mla/fused_norm_rope_attn_rope_cast.py` for the full parameter list):
@@ -109,7 +110,7 @@ static constexpr uint32_t D_NOPE = D_QK - D_ROPE;
 static constexpr uint32_t WV_GROUP_SIZE = 8;
 static constexpr bool ENABLE_Q_NORM = CONFIG.ENABLE_Q_NORM;
 static constexpr bool OVERSIZED_SMEM = CONFIG.OVERSIZED_SMEM;
-static_assert(!OVERSIZED_SMEM || (IS_DECODE && H_Q == 64));
+static_assert(!OVERSIZED_SMEM || H_Q == 64);
 static constexpr uint32_t OVERSIZED_SMEM_CAPACITY = 334848;
 
 // Cluster shape selection
