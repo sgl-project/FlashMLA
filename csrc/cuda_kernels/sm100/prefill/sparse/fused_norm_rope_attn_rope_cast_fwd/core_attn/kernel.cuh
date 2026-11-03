@@ -553,7 +553,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 cute::SM90_BULK_COPY_G2S::copy(src + i * Q_COPY_BYTES, (uint64_t*)&bar, (uint8_t*)dst + i * Q_COPY_BYTES, Q_COPY_BYTES);
             }
         };
-        if constexpr (STAGE_Q) {
+        if constexpr (STAGE_Q && IS_DECODE) {
             static_assert(Q_TOKEN_BYTES <= sizeof(smem.kv_slots[0]) && Q_TOKEN_BYTES % (2 * Q_COPY_BYTES) == 0);
             if (idx_in_warpgroup == 0) {
                 copy_q(blockIdx.x, 0, Q_TOKEN_BYTES, smem.kv_slots[NUM_KV_SLOTS - 1], smem.bar_q_stage_full[0]);
@@ -935,7 +935,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         };
 
         OuterloopArgs cur_job = get_first_job();
-        load_q_and_save_to_tmem.template operator()<STAGE_Q ? QSource::LastKvSlot : QSource::Global>(cur_job);
+        load_q_and_save_to_tmem.template operator()<STAGE_Q ? (IS_DECODE ? QSource::LastKvSlot : QSource::HalfBuffer) : QSource::Global>(cur_job);
         do {
             OuterloopArgs next_job = get_next_job(cur_job);
             shift_cached_cos_and_cached_sin();
@@ -1852,6 +1852,18 @@ bool Kernel<CONFIG>::can_use_oversized_smem() {
 
 template<Config CONFIG>
 void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>& params) {
+    if constexpr (CONFIG.FWD_MODE == SparseAttnFwdMode::Prefill && CONFIG.H_Q == 64) {
+        constexpr Config PREFILL_OVERSIZED_CONFIG = [] {
+            Config config = CONFIG;
+            config.OVERSIZED_SMEM = true;
+            config.STAGE_Q = true;
+            return config;
+        }();
+        if (params.s_q >= 16 * params.num_sm && Kernel<PREFILL_OVERSIZED_CONFIG>::can_use_oversized_smem()) {
+            Kernel<PREFILL_OVERSIZED_CONFIG>::run(params);
+            return;
+        }
+    }
     if constexpr (CONFIG.FWD_MODE == SparseAttnFwdMode::Decode && CONFIG.H_Q == 64) {
         constexpr Config OVERSIZED_CONFIG = [] {
             Config config = CONFIG;
