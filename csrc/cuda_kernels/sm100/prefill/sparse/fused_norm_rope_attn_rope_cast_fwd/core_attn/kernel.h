@@ -17,7 +17,7 @@ struct Config {
     bool ENABLE_Q_NORM;
     bool OVERSIZED_SMEM = false;
     bool STAGE_Q = true;
-    bool PIPELINED_EPILOGUE = false;   // Decode h64, at most one wave: software-pipeline the O epilogue
+    bool PIPELINED_EPILOGUE = false;   // Decode h64, at most one wave: one tile of TMEM-load lookahead in the O epilogue
     bool JOB_PREFETCH = false;         // Decode, above one wave: prefetch the next job's block 0 indices
 };
 
