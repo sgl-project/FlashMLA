@@ -19,6 +19,7 @@ struct Config {
     bool STAGE_Q = true;
     bool PIPELINED_EPILOGUE = false;   // Decode h64, at most one wave: one tile of TMEM-load lookahead in the O epilogue
     bool JOB_PREFETCH = false;         // Decode, above one wave: prefetch the next job's block 0 indices
+    bool QKV_FP8 = false;              // Prefill h64: `kv` is e4m3, and Q, K, V and P enter the UMMAs as e4m3
 };
 
 // Parameters for the fused Q-b-norm + Q RoPE + Core Attention Forward (prefill/decoding) + O RoPE + O Cast kernel
@@ -51,7 +52,15 @@ struct ParamsTemplate : Base {
 template<SparseAttnFwdMode FWD_MODE>
 using ParamT = std::conditional_t<is_decode_v<FWD_MODE>, ParamsTemplate<SparseAttnDecodeParams>, ParamsTemplate<SparseAttnFwdParams>>;
 
+// The fp8 prefill's parameters: `kv` (declared bf16* in the base) points to e4m3 data, and stride_kv_s_kv counts e4m3
+// elements
+struct PrefillFP8Params : ParamT<SparseAttnFwdMode::Prefill> {
+};
+
 template<Config CONFIG>
-void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>& params);
+using KernelParamT = std::conditional_t<CONFIG.QKV_FP8, PrefillFP8Params, ParamT<CONFIG.FWD_MODE>>;
+
+template<Config CONFIG>
+void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const KernelParamT<CONFIG>& params);
 
 }

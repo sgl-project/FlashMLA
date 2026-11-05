@@ -57,7 +57,10 @@ def prefill(
 
     Args (Core Attn):
         q: [s_q, h_q, d_qk], bfloat16
-        kv: [s_kv, h_kv, d_qk], bfloat16
+        kv: [s_kv, h_kv, d_qk], bfloat16, or float8_e4m3fn for the fp8 sparse prefill (h_q == 64 and use_legacy=False
+            only), in which Q, K, V and P all enter the tensor cores as e4m3 (Q is cast to e4m3 in the kernel after
+            RoPE). The fp8 kv is read with unit scale: values beyond e4m3's range (|x| > 448) saturate and values below
+            2^-6 lose precision
         indices: [s_q, h_kv, topk], int32. Invalid indices should be set to < 0, or >= s_kv
         sm_scale: float, scaling factor for attention scores
         d_v: value dimension, must be 512
