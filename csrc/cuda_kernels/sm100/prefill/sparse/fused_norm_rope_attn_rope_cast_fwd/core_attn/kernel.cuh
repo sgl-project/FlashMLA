@@ -1872,7 +1872,6 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>
         }();
         constexpr Config OVERSIZED_NO_STAGE_Q_CONFIG = [](Config config) {
             config.STAGE_Q = false;
-            config.PIPELINED_EPILOGUE = true;
             return config;
         }(OVERSIZED_CONFIG);
         constexpr Config OVERSIZED_JOB_PREFETCH_CONFIG = [](Config config) {
