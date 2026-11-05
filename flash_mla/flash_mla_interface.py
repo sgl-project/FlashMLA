@@ -552,3 +552,14 @@ def flash_attn_varlen_func(
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
         causal, softmax_scale, is_varlen,
     )
+
+
+def flash_mla_sparse_fwd_small_heads(q, kv, indices, sm_scale, active_heads, attn_sink=None, topk_length=None):
+    """Output-only SM10x BF16 sparse prefill with 8/32 real heads in padded Q64.
+
+    Q and optional sink must be padded to 64 heads; KV has one head. Returns
+    (compact output, None, None). Requires the matching legacy extension build.
+    """
+    return get_ops(True).sparse_prefill_fwd_small_heads(
+        q, kv, indices, sm_scale, active_heads, attn_sink, topk_length
+    )

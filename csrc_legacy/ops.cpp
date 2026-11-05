@@ -28,6 +28,9 @@ STABLE_TORCH_LIBRARY(flash_mla_legacy, m) {
         "Tensor? attn_sink=None, Tensor? topk_length=None, bool return_log2_stats=False, "
         "bool return_stats=True) -> Tensor?[]");
 
+    m.def("sparse_prefill_fwd_small_heads(Tensor q, Tensor kv, Tensor indices, float sm_scale, "
+          "int active_heads, Tensor? attn_sink=None, Tensor? topk_length=None) -> Tensor?[]");
+
     // --- Dense MLA decoding: SM90 only, and deleted upstream in the 2026.09.30 release -------
     m.def(
         "dense_decode_fwd(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, "
