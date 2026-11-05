@@ -980,17 +980,37 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             }
         };
 
-        OuterloopArgs cur_job = get_first_job();
-        load_q_and_save_to_tmem.template operator()<STAGE_Q ? (IS_DECODE ? QSource::LastKvSlot : QSource::HalfBuffer) : QSource::Global>(cur_job);
-        do {
-            OuterloopArgs next_job = get_next_job(cur_job);
-            shift_cached_cos_and_cached_sin();
-            if (next_job.is_valid) {
-                load_q_and_save_to_tmem.template operator()<STAGE_Q ? QSource::HalfBuffer : QSource::Global>(next_job);
+        if constexpr (!STAGE_Q) {
+            // Both Q loads read global memory: one call site, rotated into the loop
+            OuterloopArgs cur_job = get_first_job(), q_job = cur_job;
+            CUTE_NO_UNROLL
+            for (bool first = true; ; first = false) {
+                if (q_job.is_valid) {
+                    load_q_and_save_to_tmem.template operator()<QSource::Global>(q_job);
+                }
+                if (!first) {
+                    store_o(cur_job, !q_job.is_valid);
+                    cur_job = q_job;
+                    if (!cur_job.is_valid) {
+                        break;
+                    }
+                }
+                q_job = get_next_job(cur_job);
+                shift_cached_cos_and_cached_sin();
             }
-            store_o(cur_job, !next_job.is_valid);
-            cur_job = next_job;
-        } while (cur_job.is_valid);
+        } else {
+            OuterloopArgs cur_job = get_first_job();
+            load_q_and_save_to_tmem.template operator()<IS_DECODE ? QSource::LastKvSlot : QSource::HalfBuffer>(cur_job);
+            do {
+                OuterloopArgs next_job = get_next_job(cur_job);
+                shift_cached_cos_and_cached_sin();
+                if (next_job.is_valid) {
+                    load_q_and_save_to_tmem.template operator()<QSource::HalfBuffer>(next_job);
+                }
+                store_o(cur_job, !next_job.is_valid);
+                cur_job = next_job;
+            } while (cur_job.is_valid);
+        }
 
         NamedBarrier::arrive_and_wait(128, barrier_ids::WG0_SYNC);
         if (warp_idx == 0) {
