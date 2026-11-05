@@ -790,10 +790,10 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             //        +---+---+
             //
             // A tile is 32 columns of one atom: TMEM load, conjugate RoPE, quantization, its 32 B output store and its sf
-            // byte. Two forms of the loop below: with EPILOGUE_TILES_AHEAD > 0 the TMEM loads run ahead of the conversion,
-            // otherwise one tile is finished before the next one starts. finish_tile is a tile's work after its TMEM load;
-            // the load and the tO_empty arrive belong to the loop
-            auto finish_tile = [&](const uint32_t mma_atom_idx, const uint32_t epilogue_tile_idx_in_atom, float (&output)[EPILOGUE_TILE_SIZE], const float reduce_result_by_tmem_ld) {
+            // byte. Three forms of the loop below: with EPILOGUE_TILES_AHEAD > 0 the TMEM loads run ahead of the conversion
+            // (unrolled), with PIPELINED_EPILOGUE one load runs ahead (rolled), otherwise one tile is finished before the next
+            // one starts. finish_tile is a tile's work after its TMEM load; the load and the tO_empty arrive belong to the loop
+            auto finish_tile = [&]<bool MAY_ROPE = true>(const uint32_t mma_atom_idx, const uint32_t epilogue_tile_idx_in_atom, float (&output)[EPILOGUE_TILE_SIZE], const float reduce_result_by_tmem_ld) {
                 // RoPE (conjugate); the condition is warp-uniform
                 bool should_perform_rope;
                 {
@@ -802,17 +802,22 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     // the atom's last dims, warps (FOLD_FACTOR - 1) * H_Q_PER_CTA / 32 on, i.e. warps 2 and 3, tiles 2 and 3 of 4).
                     // The condition is warp-uniform; lane j/2 of cos/sin holds pair j/2 of the 64 RoPE dims
                     static_assert(D_ROPE / EPILOGUE_TILE_SIZE == 2 && NUM_EPILOGUE_TILES_PER_ATOM >= 2);
-                    should_perform_rope =
+                    should_perform_rope = MAY_ROPE &&
                         mma_atom_idx + 1 == NUM_MMA_ATOMS &&
                         epilogue_tile_idx_in_atom >= NUM_EPILOGUE_TILES_PER_ATOM - D_ROPE/EPILOGUE_TILE_SIZE &&
                         warp_idx >= (FOLD_FACTOR - 1) * (H_Q_PER_CTA / 32);
                     if (should_perform_rope) {
+                        // The atom's last tile takes pairs 16..31: shift them to lanes 0..15 once, so every shuffle below has an immediate lane
+                        const bool upper_pairs = epilogue_tile_idx_in_atom + 1 == NUM_EPILOGUE_TILES_PER_ATOM;
+                        const float cos_down = __shfl_down_sync(0xFFFFFFFF, cached_cos[0], EPILOGUE_TILE_SIZE / 2);
+                        const float sin_down = __shfl_down_sync(0xFFFFFFFF, cached_sin[0], EPILOGUE_TILE_SIZE / 2);
+                        const float cos_src = upper_pairs ? cos_down : cached_cos[0];
+                        const float sin_src = upper_pairs ? sin_down : cached_sin[0];
                         CUTE_UNROLL
                         for (uint32_t j = 0; j < EPILOGUE_TILE_SIZE; j += 2) {
                             float2 x = *(float2*)(output + j);
-                            uint32_t src_lane = j/2 + (epilogue_tile_idx_in_atom + 1 == NUM_EPILOGUE_TILES_PER_ATOM ? EPILOGUE_TILE_SIZE / 2 : 0);
-                            float cur_cos = __shfl_sync(0xFFFFFFFF, cached_cos[0], src_lane);
-                            float cur_sin = __shfl_sync(0xFFFFFFFF, cached_sin[0], src_lane);
+                            float cur_cos = __shfl_sync(0xFFFFFFFF, cos_src, j/2);
+                            float cur_sin = __shfl_sync(0xFFFFFFFF, sin_src, j/2);
                             float2 y = apply_rope(x, cur_cos, cur_sin);
                             *(float2*)(output + j) = y;
                         }
@@ -835,16 +840,17 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 float cur_multiplier = output_scale * sf_inv;
                 float2 cur_multiplier_float2 = float2(cur_multiplier, cur_multiplier);
 
-                fp8_e4m3 tile_fp8[EPILOGUE_TILE_SIZE];
+                uint32_t tile_fp8[EPILOGUE_TILE_SIZE / 4];
                 CUTE_UNROLL
-                for (uint32_t j = 0; j < EPILOGUE_TILE_SIZE; j += 2) {
-                    float2 x = *(float2*)(output + j);
-                    x = ku::float2_mul(x, cur_multiplier_float2);
-                    *(__nv_fp8x2_storage_t*)(tile_fp8 + j) = __nv_cvt_float2_to_fp8x2(
-                        x,
-                        __NV_SATFINITE,
-                        __nv_fp8_interpretation_t::__NV_E4M3
-                    );  // NOTE. Here we don't use cvt.f8x4type.f32 since it only has .rs mode, which affects accuracy
+                for (uint32_t j = 0; j < EPILOGUE_TILE_SIZE; j += 4) {
+                    // cvt.f8x4type.f32 has only the .rs mode: two e4m3x2 conversions into the halves of one word
+                    const float2 x0 = ku::float2_mul(*(float2*)(output + j), cur_multiplier_float2);
+                    const float2 x1 = ku::float2_mul(*(float2*)(output + j + 2), cur_multiplier_float2);
+                    asm("{\n.reg .b16 lo, hi;\n"
+                        "cvt.rn.satfinite.e4m3x2.f32 lo, %2, %1;\n"
+                        "cvt.rn.satfinite.e4m3x2.f32 hi, %4, %3;\n"
+                        "mov.b32 %0, {lo, hi};\n}"
+                        : "=r"(tile_fp8[j / 4]) : "f"(x0.x), "f"(x0.y), "f"(x1.x), "f"(x1.y));
                 }
 
                 // Store this tile's sf byte and its 32 output bytes
@@ -857,12 +863,11 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 uint32_t head_dim_idx = head_dim_idx_base + epilogue_tile_idx_in_atom * EPILOGUE_TILE_SIZE;
                 uint32_t sf_block_idx = head_idx_in_wv_group + (head_dim_idx/OUTPUT_SAVE_AS_SCALE_GRAN) * WV_GROUP_SIZE;
                 *((uint8_t*)(params.out_sf + cur_job.s_q_idx + wv_group_idx*params.stride_out_sf_wv_group + (sf_block_idx/4)*params.stride_out_sf_head_dim) + sf_block_idx%4) = (uint8_t)(exp_sf + 127);  // TODO Optimize
-                KU_STG_256(
-                    params.out_fp8 + (uint64_t)cur_job.s_q_idx*(H_Q*D_VO) + wv_group_idx*(WV_GROUP_SIZE*D_VO) + head_idx_in_wv_group*32 + head_dim_idx*WV_GROUP_SIZE,
-                    tile_fp8,
-                    "no_allocate",
-                    "evict_first"
-                );
+                asm volatile(
+                    "st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};\n"
+                    :: "l"(params.out_fp8 + (uint64_t)cur_job.s_q_idx*(H_Q*D_VO) + wv_group_idx*(WV_GROUP_SIZE*D_VO) + head_idx_in_wv_group*32 + head_dim_idx*WV_GROUP_SIZE),
+                       "r"(tile_fp8[0]), "r"(tile_fp8[1]), "r"(tile_fp8[2]), "r"(tile_fp8[3]),
+                       "r"(tile_fp8[4]), "r"(tile_fp8[5]), "r"(tile_fp8[6]), "r"(tile_fp8[7]));
             };
 
             if constexpr (EPILOGUE_TILES_AHEAD > 0) {
@@ -900,6 +905,47 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     }
                     finish_tile(t / NUM_EPILOGUE_TILES_PER_ATOM, t % NUM_EPILOGUE_TILES_PER_ATOM, outputs[t], reduce_results_by_tmem_ld[t]);
                 });
+            } else if constexpr (PIPELINED_EPILOGUE) {
+                // One tile of lookahead in a rolled loop: two output buffers, the loop body holds two tiles, so the code is two
+                // tiles long whatever NUM_TILES is. The TMEM load of tile t + 1 is issued right after the wait for tile t and
+                // runs during tile t's conversion and stores
+                static constexpr uint32_t NUM_TILES = NUM_MMA_ATOMS * NUM_EPILOGUE_TILES_PER_ATOM;
+                static_assert(NUM_TILES % 2 == 0);
+                float outputs[2][EPILOGUE_TILE_SIZE];
+                float reduce_results_by_tmem_ld[2];
+                auto issue_tile = [&](const uint32_t t, float (&output)[EPILOGUE_TILE_SIZE], float &reduce_result) {
+                    const uint32_t col = tmem_cols::O + t / NUM_EPILOGUE_TILES_PER_ATOM * NUM_O_TMEM_COLS_PER_ATOM + t % NUM_EPILOGUE_TILES_PER_ATOM * EPILOGUE_TILE_SIZE;
+                    if constexpr (IS_TMEM_LD_WITH_RED_AVAILABLE) {
+                        ku::tmem_ld_red_32dp32bNx<EPILOGUE_TILE_SIZE, true, true, true>(col, output, reduce_result);
+                    } else {
+                        ku::tmem_ld_32dp32bNx<EPILOGUE_TILE_SIZE>(col, output);
+                    }
+                };
+                // Tiles are taken in the order 0, N-2, 1, N-1, 2, 3, ..., N-3, so the two RoPE tiles (the last two) fall on the
+                // second tile of a pair and only that copy of finish_tile carries the RoPE code
+                static_assert(D_ROPE / EPILOGUE_TILE_SIZE == 2 && NUM_TILES >= 4);
+                auto tile_at = [](const uint32_t p) -> uint32_t {
+                    return p < 4 ? (p % 2 == 1 ? NUM_TILES - 2 + p / 2 : p / 2) : p - 2;
+                };
+                issue_tile(tile_at(0), outputs[0], reduce_results_by_tmem_ld[0]);
+                CUTE_NO_UNROLL
+                for (uint32_t p = 0; p < NUM_TILES; p += 2) {
+                    cute::for_each(cute::make_int_sequence<2>{}, [&](auto k_) {
+                        constexpr uint32_t k = decltype(k_)::value;
+                        cutlass::arch::fence_view_async_tmem_load();   // the load of the tile at p + k has completed
+                        if (p + k + 1 < NUM_TILES) {
+                            issue_tile(tile_at(p + k + 1), outputs[k ^ 1], reduce_results_by_tmem_ld[k ^ 1]);
+                        } else {
+                            // Every tile of O has been read out of TMEM
+                            ku::tcgen05_before_thread_sync();
+                            if (!is_last_job) {
+                                arrive_on_cta0_barrier(smem.bar_tO_empty);
+                            }
+                        }
+                        const uint32_t t = tile_at(p + k);
+                        finish_tile.template operator()<k == 1>(t / NUM_EPILOGUE_TILES_PER_ATOM, t % NUM_EPILOGUE_TILES_PER_ATOM, outputs[k], reduce_results_by_tmem_ld[k]);
+                    });
+                }
             } else {
                 // With COMPACT_PER_JOB_CODE the loops are not unrolled, so the body exists once in the binary and no per-tile
                 // state is live across iterations; the loop control adds nothing measurable (this warpgroup is busy about a
@@ -1872,6 +1918,7 @@ void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>
         }();
         constexpr Config OVERSIZED_NO_STAGE_Q_CONFIG = [](Config config) {
             config.STAGE_Q = false;
+            config.PIPELINED_EPILOGUE = true;
             return config;
         }(OVERSIZED_CONFIG);
         constexpr Config OVERSIZED_JOB_PREFETCH_CONFIG = [](Config config) {

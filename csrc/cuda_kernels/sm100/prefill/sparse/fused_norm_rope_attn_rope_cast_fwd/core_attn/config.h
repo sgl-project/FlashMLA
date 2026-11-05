@@ -173,6 +173,8 @@ static_assert(!IS_DECODE || !IS_2CTA || B_TOPK / 4 * RAW_KV_GROUP_BYTES <= SCALE
 // Prefill's code fits in the cache, and its per-job code is on the critical path between jobs, so it takes the
 // unrolled forms
 static constexpr bool JOB_PREFETCH = IS_DECODE && CONFIG.JOB_PREFETCH;
+static constexpr bool PIPELINED_EPILOGUE = CONFIG.PIPELINED_EPILOGUE;
+static_assert(!PIPELINED_EPILOGUE || (IS_DECODE && CLUSTER_SIZE == 1));
 static constexpr bool COMPACT_PER_JOB_CODE = IS_DECODE;
 
 // Registers per thread of each warpgroup.
