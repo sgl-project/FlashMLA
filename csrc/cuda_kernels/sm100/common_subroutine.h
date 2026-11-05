@@ -103,6 +103,9 @@ void retrieve_mask_and_reduce_p(
     // Mask invalid tokens
     // We put masking before reduction, since (-inf) + anything (except nan and +inf) is (-inf), which guarantees correctness, and this can overlap with smem load
     static_assert(NUM_ELEMS_PER_THREAD == 48 || NUM_ELEMS_PER_THREAD == 32);
+    // The 32 (prefill, decode) or 48 (2-CTA prefill) mask bits of one thread, as a single integer, so the fast path
+    // below can compare the whole word against all-ones.
+    using is_k_valid_mask_t = cute::conditional_t<NUM_ELEMS_PER_THREAD == 32, uint32_t, uint64_t>;
     int k_validness_offset = local_warp_idx >= 2 ? NUM_ELEMS_PER_THREAD/8 : 0;  // |0|2| \n |1|3|
     uint8_t is_k_valid_masks[NUM_ELEMS_PER_THREAD / 8];
     if constexpr (NUM_ELEMS_PER_THREAD == 32) {
@@ -112,10 +115,32 @@ void retrieve_mask_and_reduce_p(
         *(uint16_t*)(is_k_valid_masks + 2) = *(uint16_t*)(k_validness_base + k_validness_offset + 2);
         *(uint16_t*)(is_k_valid_masks + 4) = *(uint16_t*)(k_validness_base + k_validness_offset + 4);
     }
-    CUTE_UNROLL
-    for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 1) {
-        if (!(is_k_valid_masks[i/8] >> (i%8) & 1))
-            p[i] = -CUDART_INF_F;
+    // Skip the per-element bit test when every token in this KV block is valid. Each element of
+    // the loop below costs a shift, an AND, a compare and a select, and the loop runs on every KV
+    // block -- including every block in which all B_TOPK tokens are valid, which is all of them
+    // whenever topk_length is a multiple of B_TOPK, and all but the last one per token under the
+    // causal-simulation use of topk_length. The mask bytes were already loaded as one
+    // is_k_valid_mask_t, so the guard is a single compare against all-ones, and it is warp-uniform
+    // (every lane of a warp reads the same is_k_valid address) so it adds no divergence. When any
+    // token is invalid the original loop runs unchanged, so the result is bit-identical.
+    // Compare exactly the bytes that were loaded above. NUM_ELEMS_PER_THREAD == 48 only fills 6 of
+    // the 8 bytes of a uint64_t, so reading the array as is_k_valid_mask_t there would read 2 bytes
+    // past it and compare against garbage.
+    bool any_k_invalid;
+    if constexpr (NUM_ELEMS_PER_THREAD == 48) {
+        any_k_invalid = (*(const uint16_t*)(is_k_valid_masks + 0) != (uint16_t)0xFFFFu)
+                      | (*(const uint16_t*)(is_k_valid_masks + 2) != (uint16_t)0xFFFFu)
+                      | (*(const uint16_t*)(is_k_valid_masks + 4) != (uint16_t)0xFFFFu);
+    } else {
+        any_k_invalid = *(const is_k_valid_mask_t*)is_k_valid_masks
+                        != (is_k_valid_mask_t)~(is_k_valid_mask_t)0;
+    }
+    if (any_k_invalid) {
+        CUTE_UNROLL
+        for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 1) {
+            if (!(is_k_valid_masks[i/8] >> (i%8) & 1))
+                p[i] = -CUDART_INF_F;
+        }
     }
 
     // Reduce P within the cluster
