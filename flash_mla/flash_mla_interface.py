@@ -554,6 +554,14 @@ def flash_attn_varlen_func(
     )
 
 
+def has_small_heads_prefill() -> bool:
+    """Whether the loaded legacy extension provides compact small-head prefill."""
+    try:
+        return hasattr(get_ops(True), "sparse_prefill_fwd_small_heads")
+    except (ImportError, OSError, RuntimeError, AttributeError):
+        return False
+
+
 def flash_mla_sparse_fwd_small_heads(q, kv, indices, sm_scale, active_heads, attn_sink=None, topk_length=None):
     """Output-only SM10x BF16 sparse prefill with 8/32 real heads in padded Q64.
 
