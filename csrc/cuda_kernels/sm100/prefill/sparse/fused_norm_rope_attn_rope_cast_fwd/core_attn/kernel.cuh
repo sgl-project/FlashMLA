@@ -36,6 +36,30 @@ float2 apply_rope(const float2 &x, const float &cur_cos, const float &cur_sin) {
     return y;
 }
 
+// QKV_FP8: S := exp2(p * scale - new_max) cast to e4m3 for the P@V UMMA (S <= 2^6 relative to the running max, see the
+// rescale threshold), and its fp32 sum
+template<int NUM_ELEMS_PER_THREAD>
+__device__ __forceinline__
+float get_s_fp8_from_p(
+    fp8_e4m3 s[NUM_ELEMS_PER_THREAD],
+    const float p[NUM_ELEMS_PER_THREAD],
+    float scale,
+    float new_max
+) {
+    float2 cur_sum = float2 {0.0f, 0.0f};
+    const float2 neg_new_max_float2 = float2 {-new_max, -new_max};
+    const float2 scale_float2 = float2 {scale, scale};
+    CUTE_UNROLL
+    for (int i = 0; i < NUM_ELEMS_PER_THREAD/2; ++i) {
+        float2 d = ku::float2_fma(float2{p[i*2], p[i*2+1]}, scale_float2, neg_new_max_float2);
+        d.x = exp2f(d.x);
+        d.y = exp2f(d.y);
+        cur_sum = ku::float2_add(cur_sum, d);
+        *(__nv_fp8x2_storage_t*)(s + i*2) = __nv_cvt_float2_to_fp8x2(d, __NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
+    }
+    return cur_sum.x + cur_sum.y;
+}
+
 // To achieve prefill - decoding alignment while using block_size = 96, decoding must reproduce
 // prefill's "natural" blocking of the concatenated indices array ([topk orig slots; extra_topk
 // extra slots], tiled by B_TOPK). Since topk (e.g. 128) may not be a multiple of B_TOPK (e.g. 96),
@@ -610,8 +634,13 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             }
             CUTE_UNROLL
             for (uint32_t local_tile_idx = 3; local_tile_idx != 0xFFFFFFFF; --local_tile_idx) {
-                // Rail j holds the 64-dim tiles j, j+2, j+4, j+6 (1 CTA) or the CTA's half of the dims in order (2 CTAs)
+                // Rail j holds the 64-dim tiles j, j+2, j+4, j+6 (1 CTA) or the CTA's half of the dims in order (2 CTAs).
+                // QKV_FP8: the swizzle width is 128 dims, so rail j holds the tiles 2j, 2j+1, 4+2j, 5+2j (config.h); local
+                // tile 3 is still the RoPE tile of rail 1
                 uint32_t tile_idx = CLUSTER_SIZE == 1 ? local_tile_idx * 2 + rail : rail * 4 + local_tile_idx;
+                if constexpr (QKV_FP8) {
+                    tile_idx = (local_tile_idx / 2) * 4 + (local_tile_idx % 2) + rail * 2;
+                }
                 if constexpr (Q_SRC == QSource::HalfBuffer) {
                     // Local tiles 3 and 2 are the upper half of the dims, 1 and 0 the lower half
                     static_assert(CLUSTER_SIZE == 1);
@@ -689,12 +718,28 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     smem.bar_q_half_free[0].wait(1);
                 }
             }
+
             smem.bar_tQ_empty.wait(cur_job.job_idx_mod_2^1);
             ku::tcgen05_after_thread_sync();
             
-            static constexpr uint32_t NUM_CACHED_UINT32 = NUM_CACHED_Q_BF16_PER_THREAD/2;
-            ku::tmem_st_32dp32bNx<NUM_CACHED_UINT32/2>(tmem_cols::Q, cached_q);
-            ku::tmem_st_32dp32bNx<NUM_CACHED_UINT32/2>(tmem_cols::Q+NUM_CACHED_UINT32/2, cached_q+NUM_CACHED_UINT32/2*2);   // Two stores: one store of all NUM_CACHED_UINT32 words does not compile (insufficient registers)
+            if constexpr (QKV_FP8) {
+                // Cast to e4m3 right before the TMEM store, a pair at a time: bf16x2 -> f32x2 (exact) -> one
+                // cvt.rn.satfinite.e4m3x2.f32. One 32-bit TMEM word holds 4 e4m3 with k increasing inside the word
+                fp8_e4m3 cached_q_fp8[NUM_CACHED_Q_BF16_PER_THREAD];
+                CUTE_UNROLL
+                for (uint32_t i = 0; i < NUM_CACHED_Q_BF16_PER_THREAD; i += 2) {
+                    float2 x = __bfloat1622float2(*(nv_bfloat162*)(cached_q + i));
+                    *(__nv_fp8x2_storage_t*)(cached_q_fp8 + i) =
+                        __nv_cvt_float2_to_fp8x2(x, __NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
+                }
+                static constexpr uint32_t NUM_CACHED_UINT32 = NUM_CACHED_Q_BF16_PER_THREAD / Q_ELEMS_PER_TMEM_WORD;
+                ku::tmem_st_32dp32bNx<NUM_CACHED_UINT32/2>(tmem_cols::Q, cached_q_fp8);
+                ku::tmem_st_32dp32bNx<NUM_CACHED_UINT32/2>(tmem_cols::Q+NUM_CACHED_UINT32/2, cached_q_fp8+NUM_CACHED_UINT32/2*Q_ELEMS_PER_TMEM_WORD);
+            } else {
+                static constexpr uint32_t NUM_CACHED_UINT32 = NUM_CACHED_Q_BF16_PER_THREAD/2;
+                ku::tmem_st_32dp32bNx<NUM_CACHED_UINT32/2>(tmem_cols::Q, cached_q);
+                ku::tmem_st_32dp32bNx<NUM_CACHED_UINT32/2>(tmem_cols::Q+NUM_CACHED_UINT32/2, cached_q+NUM_CACHED_UINT32/2*2);   // Two stores: one store of all NUM_CACHED_UINT32 words does not compile (insufficient registers)
+            }
             cutlass::arch::fence_view_async_tmem_store();
 
             ku::tcgen05_before_thread_sync();
@@ -1027,7 +1072,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         // S is K-major with 8-row core matrices (INTER layout), so a head's 8 tokens are 16 B at row * 16 B of the token group's block
         static_assert(FOLD_FACTOR == 2);
         const uint32_t token_slice = local_warp_idx >= 2 ? 1u : 0u;
-        bf16 *sS_base = smem.s + token_slice * (H_Q_PER_CTA * (B_TOPK / FOLD_FACTOR)) + (idx_in_warpgroup % H_Q_PER_CTA) * 8;
+        KVElem *sS_base = smem.s + token_slice * (H_Q_PER_CTA * (B_TOPK / FOLD_FACTOR)) + (idx_in_warpgroup % H_Q_PER_CTA) * S_CHUNK_ELEMS;
         RingBufferState rs;
         do {
             // For definition and consistency about `mi`, `li`, and `real_mi`, plz refer to head64 prefill
@@ -1079,6 +1124,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     p
                 );
 
+
                 float cur_pi_max = get_max<NUM_ELEMS_PER_THREAD>(p);
                 cur_pi_max *= score_multiplier;
 
@@ -1106,15 +1152,20 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 mi = new_max;   // mi is still identical within each row
 
                 // Calculate S
-                nv_bfloat16 s[NUM_ELEMS_PER_THREAD];
-                float cur_sum = get_s_from_p<NUM_ELEMS_PER_THREAD>((nv_bfloat162*)s, p, score_multiplier, new_max);
+                KVElem s[NUM_ELEMS_PER_THREAD];
+                float cur_sum;
+                if constexpr (QKV_FP8) {
+                    cur_sum = get_s_fp8_from_p<NUM_ELEMS_PER_THREAD>(s, p, score_multiplier, new_max - P_LOG2_SCALE);
+                } else {
+                    cur_sum = get_s_from_p<NUM_ELEMS_PER_THREAD>((nv_bfloat162*)s, p, score_multiplier, new_max);
+                }
                 li = fmaf(li, scale_for_old, cur_sum);
 
                 // Store S
                 smem.bar_SO_empty.wait(rs.get<1>().second^1);
                 CUTE_UNROLL
-                for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; ++i) {
-                    ku::st_shared(sS_base + i*8*H_Q_PER_CTA, *(__int128_t*)(s + i*8));
+                for (int i = 0; i < NUM_ELEMS_PER_THREAD/(int)S_CHUNK_ELEMS; ++i) {
+                    ku::st_shared(sS_base + i*S_CHUNK_ELEMS*H_Q_PER_CTA, *(__int128_t*)(s + i*S_CHUNK_ELEMS));
                 }
 
                 // Rescale O
@@ -1143,7 +1194,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     uint32_t global_index = cur_job.s_q_idx * H_Q + cta_idx * H_Q_PER_CTA + idx_in_warpgroup;
                     params.max_logits[global_index] = real_mi * CUDART_LN2_F;
                 }
-                smem.rowwise_mi_buf[idx_in_warpgroup] = mi;
+                // li is 2^P_LOG2_SCALE times the sum of the unscaled S: undo it in the max the epilogue sees (-inf stays -inf)
+                smem.rowwise_mi_buf[idx_in_warpgroup] = P_LOG2_SCALE != 0.0f ? mi - P_LOG2_SCALE : mi;
             }
             smem.rowwise_li_buf[idx_in_warpgroup] = li;
             smem.bar_li_mi_full.arrive();
@@ -1162,7 +1214,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             Tensor tP = partition_fragment_C(tiled_mma_qk, Shape<Int<H_Q_PER_CTA>, Int<B_TOPK * NUM_MRGEMM_RAILS>>{});
             Tensor sS = make_tensor(
                 make_smem_ptr(smem.s),
-                ku::make_umma_canonical_k_major_layout<H_Q_PER_CTA, B_TOPK, 0>()
+                ku::make_umma_canonical_k_major_layout<H_Q_PER_CTA, B_TOPK, 0, KVElem>()
             );
             Tensor tO = partition_fragment_C(tiled_mma_sv, Shape<Int<H_Q_PER_CTA>, Int<D_VO>>{});
             tQ.data().get() = tmem_cols::Q;
@@ -1176,7 +1228,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 auto kv_slot_idx = rs_qk.get<NUM_KV_SLOTS>().first;
                 Tensor sK = make_tensor(
                     make_smem_ptr(smem.kv_slots[kv_slot_idx]),
-                    ku::make_umma_canonical_k_major_layout<B_TOPK / CLUSTER_SIZE * NUM_MRGEMM_RAILS, D_QK / NUM_MRGEMM_RAILS, 128>()
+                    ku::make_umma_canonical_k_major_layout<B_TOPK / CLUSTER_SIZE * NUM_MRGEMM_RAILS, D_QK / NUM_MRGEMM_RAILS, 128, KVElem>()
                 );
                 auto p_buf_idx = rs_qk.get<NUM_P_BUFS>().first;
                 tP.data().get() = tmem_cols::get_p(p_buf_idx);
@@ -1196,7 +1248,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 if constexpr (IS_DECODE) {
                     smem.bar_kv_slot_full[kv_slot_idx].arrive();
                 } else {
-                    smem.bar_kv_slot_full[kv_slot_idx].arrive_and_expect_tx(B_TOPK*D_QK*sizeof(bf16));
+                    smem.bar_kv_slot_full[kv_slot_idx].arrive_and_expect_tx(B_TOPK*D_QK*sizeof(KVElem));
                 }
             };
             // Issue SV on the current kv slot. The caller has waited on SO_full and, for the first block of
@@ -1205,7 +1257,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 auto kv_slot_idx = rs_sv.get<NUM_KV_SLOTS>().first;
                 Tensor sV = make_tensor(
                     make_smem_ptr(smem.kv_slots[kv_slot_idx]),
-                    ku::make_umma_canonical_mn_major_layout<D_VO / CLUSTER_SIZE, B_TOPK, 128>()
+                    ku::make_umma_canonical_mn_major_layout<D_VO / CLUSTER_SIZE, B_TOPK, 128, KVElem>()
                 );
                 ku::tcgen05_after_thread_sync();
                 ku::utcmma_ss(tiled_mma_sv, sS, sV, tO, kv_block_idx == 0);
@@ -1683,7 +1735,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             DequantRows<Kernel, 0> dq_rows(smem, local_warp_idx, lane_idx, cta_idx);
             run_dequant_warps(dq_rows);
         } else {
-            // KV Producer (prefill): gathers the whole bf16 KV block via TMA gather4
+            // KV Producer (prefill): gathers the whole bf16 (QKV_FP8: e4m3) KV block via TMA gather4, one 128 B swizzle-atom
+            // row (KV_CHUNK_ELEMS elements) per gather and row
             if (elect_one_sync()) {
                 OuterloopArgs cur_job = get_first_job();
                 RingBufferState rs;
@@ -1712,7 +1765,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                         for (uint32_t local_row = 0; local_row < NUM_ROW_PER_WARP / 4; local_row += 1) {
                             uint32_t row = local_row * 4 * 4 + local_warp_idx * 4;
                             CUTE_UNROLL
-                            for (uint32_t tile_idx = 0; tile_idx < (CLUSTER_SIZE == 2 ? (D_QK/2/64) : (D_QK/64)); ++tile_idx) {
+                            for (uint32_t tile_idx = 0; tile_idx < (CLUSTER_SIZE == 2 ? (D_QK/2/KV_CHUNK_ELEMS) : (D_QK/KV_CHUNK_ELEMS)); ++tile_idx) {
                                 /*
                                 For cases where CLUSTER_SIZE == 1, each CTA reads the full K/V
                                 For cases where CLUSTER_SIZE == 2, CTA0 reads KV[:, :D_QK/2] and CTA1 reads KV[:, D_QK/2:], since dual GeM< is used
@@ -1721,8 +1774,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                                     ku::tma_gather4(
                                         &tma_params.tensor_map_kv,
                                         smem.bar_kv_slot_full[kv_slot_idx],
-                                        smem.kv_slots[kv_slot_idx] + tile_idx * B_TOPK * 64 + row * 64,
-                                        tile_idx * 64,
+                                        smem.kv_slots[kv_slot_idx] + tile_idx * B_TOPK * KV_CHUNK_ELEMS + row * KV_CHUNK_ELEMS,
+                                        tile_idx * KV_CHUNK_ELEMS,
                                         topk_idxs[local_row],
                                         (int64_t)TMA::CacheHintSm90::EVICT_LAST
                                     );
@@ -1730,8 +1783,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                                     ku::tma_gather4_cta_group_2<true>(
                                         &tma_params.tensor_map_kv,
                                         smem.bar_kv_slot_full[kv_slot_idx],
-                                        smem.kv_slots[kv_slot_idx] + tile_idx * B_TOPK * 64 + row * 64,
-                                        tile_idx * 64 + cta_idx * (D_QK/2),
+                                        smem.kv_slots[kv_slot_idx] + tile_idx * B_TOPK * KV_CHUNK_ELEMS + row * KV_CHUNK_ELEMS,
+                                        tile_idx * KV_CHUNK_ELEMS + cta_idx * (D_QK/2),
                                         topk_idxs[local_row],
                                         (int64_t)TMA::CacheHintSm90::EVICT_LAST
                                     );
@@ -1820,12 +1873,13 @@ void Kernel<CONFIG>::run(const Params &params) {
             }
         }
     } else {
+        // The box is one 128 B swizzle-atom row; e4m3 is moved as UINT8
         tma_params.tensor_map_kv = ku::make_tensor_map(
             {(uint64_t)D_QK, (uint64_t)params.s_kv},
-            {(uint64_t)params.stride_kv_s_kv * sizeof(bf16)},
-            {64, 1},
+            {(uint64_t)params.stride_kv_s_kv * sizeof(KVElem)},
+            {KV_CHUNK_ELEMS, 1},
             params.kv,
-            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 
+            QKV_FP8 ? CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8 : CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B
         );
@@ -1917,8 +1971,9 @@ bool Kernel<CONFIG>::can_use_oversized_smem() {
 
 
 template<Config CONFIG>
-void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>& params) {
-    if constexpr (CONFIG.FWD_MODE == SparseAttnFwdMode::Prefill && CONFIG.H_Q == 64) {
+void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const KernelParamT<CONFIG>& params) {
+    // The fp8 prefill has 4 KV slots without the oversized shared memory, and no staged-Q variant
+    if constexpr (CONFIG.FWD_MODE == SparseAttnFwdMode::Prefill && CONFIG.H_Q == 64 && !CONFIG.QKV_FP8) {
         constexpr Config PREFILL_OVERSIZED_CONFIG = [] {
             Config config = CONFIG;
             config.OVERSIZED_SMEM = true;
