@@ -862,7 +862,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     mma_atom_idx * NUM_O_TMEM_COLS_PER_ATOM + (warp_idx/(H_Q_PER_CTA/32)) * MMA_ATOM_N;
                 uint32_t head_dim_idx = head_dim_idx_base + epilogue_tile_idx_in_atom * EPILOGUE_TILE_SIZE;
                 uint32_t sf_block_idx = head_idx_in_wv_group + (head_dim_idx/OUTPUT_SAVE_AS_SCALE_GRAN) * WV_GROUP_SIZE;
-                const uint32_t sf_row = params.out_sf_flashinfer_layout ?
+                const uint32_t sf_row = params.out_sf_swizzled_128x4 ?
                     (((cur_job.s_q_idx >> 7) << 12) | ((cur_job.s_q_idx & 31) << 2) | ((cur_job.s_q_idx >> 5) & 3)) : cur_job.s_q_idx;
                 *((uint8_t*)(params.out_sf + sf_row + wv_group_idx*params.stride_out_sf_wv_group + (sf_block_idx/4)*params.stride_out_sf_head_dim) + sf_block_idx%4) = (uint8_t)(exp_sf + 127);  // TODO Optimize
                 asm volatile(
