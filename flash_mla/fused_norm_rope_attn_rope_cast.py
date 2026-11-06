@@ -87,17 +87,14 @@ def prefill(
         If a q token does not attend to any k token, then max_logits is -inf, lse is +inf, out is all zeros.
     """
     ops = get_ops(use_legacy)
-    extra = ()
-    if out_sf_swizzled_128x4:
-        if use_legacy:
-            raise ValueError("out_sf_swizzled_128x4 is not supported by the legacy kernels")
-        extra = (True,)
+    if out_sf_swizzled_128x4 and use_legacy:
+        raise ValueError("out_sf_swizzled_128x4 is not supported by the legacy kernels")
     results = ops.fused_norm_rope_attn_rope_cast_fwd(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length,
 
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
 
-        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0, *extra
+        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0, *((True,) if out_sf_swizzled_128x4 else ())
     )
     out_fp8, out_sf, max_logits, lse = results
     return out_fp8, out_sf, max_logits, lse

@@ -2,7 +2,6 @@
 import pytest
 import torch
 
-import flash_mla
 from flash_mla import fused_norm_rope_attn_rope_cast as fused
 
 
@@ -36,10 +35,10 @@ def _swizzle_128x4(sf_words):
 @pytest.mark.parametrize("s_q", [128, 512, 1024, 4096])
 def test_out_sf_swizzled_128x4(s_q):
     out_fp8, out_sf, max_logits, lse = _run(s_q, False)
-    fi_fp8, fi_sf, fi_max_logits, fi_lse = _run(s_q, True)
-    assert torch.equal(out_fp8.view(torch.uint8), fi_fp8.view(torch.uint8))
-    assert torch.equal(lse, fi_lse) and torch.equal(max_logits, fi_max_logits)
-    raw = torch.as_strided(fi_sf, (fi_sf.numel(),), (1,))
+    sw_fp8, sw_sf, sw_max_logits, sw_lse = _run(s_q, True)
+    assert torch.equal(out_fp8.view(torch.uint8), sw_fp8.view(torch.uint8))
+    assert torch.equal(lse, sw_lse) and torch.equal(max_logits, sw_max_logits)
+    raw = torch.as_strided(sw_sf, (sw_sf.numel(),), (1,))
     assert torch.equal(raw, _swizzle_128x4(out_sf))
 
 
