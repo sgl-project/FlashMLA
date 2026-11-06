@@ -46,6 +46,8 @@ struct ParamsTemplate : Base {
     fp8_e4m3* __restrict__ out_fp8; // [s_q, n_wv_group, wv_group_size * d_v]
     uint32_t* __restrict__ out_sf;   // [s_q, n_wv_group, (wv_group_size*d_v) / 32 / 4], contiguous on the first (s_q) dim
     uint32_t stride_out_sf_wv_group, stride_out_sf_head_dim;
+    // out_sf in the 128x4-swizzled scale layout per wv group: row r at word (r/128)*128*words_per_row + (r%32)*4 + (r/32)%4, 4-column stride 128
+    bool out_sf_swizzled_128x4 = false;
 };
 
 template<SparseAttnFwdMode FWD_MODE>

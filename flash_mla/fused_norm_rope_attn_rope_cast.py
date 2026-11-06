@@ -33,6 +33,7 @@ def prefill(
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     use_legacy: bool = False,
+    out_sf_swizzled_128x4: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     A fused kernel for Q Norm + Q RoPE + Core Attn (sparse attention) + O RoPE + O cast to FP8, for DeepSeek-V4.1
@@ -69,21 +70,31 @@ def prefill(
         use_legacy: bool. Route to the frozen pre-2026.09.30 kernels, which read the V4 and the
             pre-release block-split V4.1 KV cache formats instead of the interleaved ones. The
             two sides take the same arguments; `kv` decides the format by its bytes per token.
+        out_sf_swizzled_128x4: bool. Write out_sf in the 128x4-swizzled scale-factor layout instead of the packed
+            column-major one: per wv group, the [s_q, wv_group_size * d_v / 32] UE8M0 matrix is cut into 128-row x
+            4-column atoms of 512 bytes, byte (r, c) of an atom at (r % 32) * 16 + (r // 32) * 4 + c, atoms ordered
+            column-block-major within each 128-row block. This is the layout block-scaled tcgen05 MMAs read scale factors
+            in, and the one `flashinfer.mxfp8_quantize(..., is_sf_swizzled_layout=True)` produces, so such GEMMs can read
+            it directly. Needs s_q % 128 == 0. The bytes are the same as in the default layout; only their positions change.
 
     Returns:
         - out_fp8: [s_q, n_wv_group, wv_group_size * d_v], fp8_e4m3, quantized attention result (wv_group_size = h_q / n_wv_group)
-        - out_sf: [s_q, n_wv_group, wv_group_size * d_v / (32*4)], int32, scaling factor. Always stored in the per-32 scaled format (num_per_channels is always 32)
+        - out_sf: [s_q, n_wv_group, wv_group_size * d_v / (32*4)], int32, scaling factor. Always stored in the per-32 scaled format (num_per_channels is always 32).
+            With out_sf_swizzled_128x4, the storage is [n_wv_group, 128x4-swizzled words] and this shape is a view
+            whose strides do not describe the swizzle; pass `out_sf.data_ptr()` to the consumer.
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float
         If a q token does not attend to any k token, then max_logits is -inf, lse is +inf, out is all zeros.
     """
     ops = get_ops(use_legacy)
+    if out_sf_swizzled_128x4 and use_legacy:
+        raise ValueError("out_sf_swizzled_128x4 is not supported by the legacy kernels")
     results = ops.fused_norm_rope_attn_rope_cast_fwd(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length,
 
         enable_q_norm, rms_norm_eps, token_positions, is_rope_neox_style, rope_dim, cos_sin_cache,
 
-        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0
+        n_wv_group, num_per_channels, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0, *((True,) if out_sf_swizzled_128x4 else ())
     )
     out_fp8, out_sf, max_logits, lse = results
     return out_fp8, out_sf, max_logits, lse

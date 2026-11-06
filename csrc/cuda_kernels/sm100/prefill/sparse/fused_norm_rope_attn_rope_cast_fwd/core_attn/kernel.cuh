@@ -754,6 +754,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format, although it will be actually (numerically) per-128 scaled when num_per_channels is 128
             static constexpr uint32_t OUTPUT_SAVE_AS_SCALE_GRAN = 32;
             static_assert(EPILOGUE_TILE_SIZE == OUTPUT_SAVE_AS_SCALE_GRAN, "one tile = one 32 B output store + one sf byte");
+            static constexpr uint32_t SF_WORDS_PER_ROW = WV_GROUP_SIZE * D_VO / (OUTPUT_SAVE_AS_SCALE_GRAN * 4);
 
             uint32_t head_idx = cta_idx*H_Q_PER_CTA + idx_in_warpgroup%H_Q_PER_CTA;
             uint32_t wv_group_idx = head_idx / WV_GROUP_SIZE;
@@ -862,7 +863,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     mma_atom_idx * NUM_O_TMEM_COLS_PER_ATOM + (warp_idx/(H_Q_PER_CTA/32)) * MMA_ATOM_N;
                 uint32_t head_dim_idx = head_dim_idx_base + epilogue_tile_idx_in_atom * EPILOGUE_TILE_SIZE;
                 uint32_t sf_block_idx = head_idx_in_wv_group + (head_dim_idx/OUTPUT_SAVE_AS_SCALE_GRAN) * WV_GROUP_SIZE;
-                *((uint8_t*)(params.out_sf + cur_job.s_q_idx + wv_group_idx*params.stride_out_sf_wv_group + (sf_block_idx/4)*params.stride_out_sf_head_dim) + sf_block_idx%4) = (uint8_t)(exp_sf + 127);  // TODO Optimize
+                const uint32_t sf_row = params.out_sf_swizzled_128x4 ?
+                    (cur_job.s_q_idx / 128) * (128 * SF_WORDS_PER_ROW) + (cur_job.s_q_idx % 32) * 4 + (cur_job.s_q_idx / 32) % 4 : cur_job.s_q_idx;
+                *((uint8_t*)(params.out_sf + sf_row + wv_group_idx*params.stride_out_sf_wv_group + (sf_block_idx/4)*params.stride_out_sf_head_dim) + sf_block_idx%4) = (uint8_t)(exp_sf + 127);  // TODO Optimize
                 asm volatile(
                     "st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};\n"
                     :: "l"(params.out_fp8 + (uint64_t)cur_job.s_q_idx*(H_Q*D_VO) + wv_group_idx*(WV_GROUP_SIZE*D_VO) + head_idx_in_wv_group*32 + head_dim_idx*WV_GROUP_SIZE),

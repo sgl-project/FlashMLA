@@ -49,7 +49,8 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     int64_t num_per_channels,
     bool use_tma_aligned_col_major_sf,
     bool round_sf,
-    bool use_packed_ue8m0
+    bool use_packed_ue8m0,
+    bool out_sf_swizzled_128x4
 ) {
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
@@ -125,11 +126,15 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     STD_TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
     Tensor out_fp8 = torch::stable::new_empty(q, {s_q, n_wv_group, wv_group_size * d_v}, ScalarType::Float8_e4m3fn);
     uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format (num_per_channels is always 32)
-    Tensor out_sf = torch::stable::transpose(allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group), 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
+    STD_TORCH_CHECK(!out_sf_swizzled_128x4 || s_q % 128 == 0, "out_sf_swizzled_128x4 needs s_q to be a multiple of 128, got ", s_q);
+    const uint32_t sf_words_per_row = wv_group_size * d_v / (out_sf_scale_gran * 4);
+    Tensor out_sf = out_sf_swizzled_128x4 ?
+        torch::stable::transpose(torch::stable::new_empty(q, {n_wv_group, s_q, sf_words_per_row}, ScalarType::Int), 0, 1) :
+        torch::stable::transpose(allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group), 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
     Tensor max_logits = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     KU_CHECK_CONTIGUOUS(out_fp8);
-    STD_TORCH_CHECK(out_sf.stride(0) == 1);
+    STD_TORCH_CHECK(out_sf_swizzled_128x4 || out_sf.stride(0) == 1);
     KU_CHECK_CONTIGUOUS(max_logits);
     KU_CHECK_CONTIGUOUS(lse);
 
@@ -172,7 +177,8 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
         (fp8_e4m3*)out_fp8.data_ptr(),
         (uint32_t*)out_sf.data_ptr(),
         (uint32_t)int64_stride_to_int(out_sf.stride(1)),
-        (uint32_t)int64_stride_to_int(out_sf.stride(2))
+        out_sf_swizzled_128x4 ? 128u : (uint32_t)int64_stride_to_int(out_sf.stride(2)),
+        out_sf_swizzled_128x4
     };
 
     DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
