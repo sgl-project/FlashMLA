@@ -1,4 +1,5 @@
 #include "common.h"
+#include "kernels/sm100/prefill/sparse/fwd/small_heads/phase1.h"
 
 #include "kernels/params.h"
 
@@ -92,7 +93,7 @@ protected:
     }
 };
 
-std::vector<std::optional<Tensor>> sparse_attn_prefill_interface(
+std::vector<std::optional<Tensor>> sparse_attn_prefill_impl(
     const Tensor &q,
     const Tensor &kv,
     const Tensor &indices,
@@ -101,7 +102,8 @@ std::vector<std::optional<Tensor>> sparse_attn_prefill_interface(
     const std::optional<Tensor> &attn_sink,
     const std::optional<Tensor> &topk_length,
     bool return_log2_stats = false,
-    bool return_stats = true
+    bool return_stats = true,
+    int64_t active_heads = 0
 ) {
     using bf16 = cutlass::bfloat16_t;
     
@@ -154,7 +156,13 @@ std::vector<std::optional<Tensor>> sparse_attn_prefill_interface(
     // Allocate results and buffers
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
     
-    Tensor out = torch::stable::new_empty(q, {s_q, h_q, d_v});
+    if (active_heads) {
+        STD_TORCH_CHECK(is_sm100f && h_q == 64 && h_kv == 1 &&
+            (active_heads == 8 || active_heads == 32) && topk >= 128 && topk % 64 == 0,
+            "small-head sparse MLA prefill requires SM10x, Q64, KV1, active heads 8/32 and topk >=128 divisible by 64");
+        STD_TORCH_CHECK(!return_stats, "small-head sparse MLA prefill is output-only");
+    }
+    Tensor out = torch::stable::new_empty(q, {s_q, active_heads ? active_heads : h_q, d_v});
     std::optional<Tensor> lse, max_logits;
     if (return_stats) {
         lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
@@ -188,6 +196,19 @@ std::vector<std::optional<Tensor>> sparse_attn_prefill_interface(
         return_log2_stats,
         get_current_stream()
     };
+
+    if (active_heads) {
+        SparseAttnSmallHeadsFwdParams small_heads_params{};
+        static_cast<SparseAttnFwdParams&>(small_heads_params) = params;
+        small_heads_params.active_heads = active_heads;
+        small_heads_params.output_heads = active_heads;
+        if (s_q) {
+            DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
+                legacy::sm100::prefill::sparse_fwd::small_heads::run_sparse_fwd_phase1_kernel<SparseAttnFwdMode::Prefill, HEAD_DIM_QK>(small_heads_params);
+            });
+        }
+        return {out, max_logits, lse};
+    }
 
     std::vector<FwdFeatures> required_features;
     if (h_q == 64) {
@@ -243,6 +264,24 @@ std::vector<std::optional<Tensor>> sparse_attn_prefill_interface(
     return {out, max_logits, lse};
 }
 
+std::vector<std::optional<Tensor>> sparse_attn_prefill_interface(
+    const Tensor &q, const Tensor &kv, const Tensor &indices, double sm_scale,
+    int64_t d_v, const std::optional<Tensor> &attn_sink,
+    const std::optional<Tensor> &topk_length, bool return_log2_stats, bool return_stats) {
+    return sparse_attn_prefill_impl(q, kv, indices, sm_scale, d_v, attn_sink,
+        topk_length, return_log2_stats, return_stats);
+}
+
+std::vector<std::optional<Tensor>> sparse_prefill_fwd_small_heads(
+    const Tensor &q, const Tensor &kv, const Tensor &indices, double sm_scale,
+    int64_t active_heads, const std::optional<Tensor> &attn_sink,
+    const std::optional<Tensor> &topk_length) {
+    STD_TORCH_CHECK(active_heads == 8 || active_heads == 32, "active_heads must be 8 or 32");
+    return sparse_attn_prefill_impl(q, kv, indices, sm_scale, 512, attn_sink,
+        topk_length, false, false, active_heads);
+}
+
 STABLE_TORCH_LIBRARY_IMPL(flash_mla_legacy, CUDA, m) {
+    m.impl("sparse_prefill_fwd_small_heads", TORCH_BOX(&sparse_prefill_fwd_small_heads));
     m.impl("sparse_prefill_fwd", TORCH_BOX(&sparse_attn_prefill_interface));
 }

@@ -175,6 +175,12 @@ struct SparseAttnFwdParams {
     cudaStream_t stream;
 };
 
+// Separate parameter type preserves existing prefill and fused-kernel layouts.
+struct SparseAttnSmallHeadsFwdParams : SparseAttnFwdParams {
+    int active_heads;
+    int output_heads;
+};
+
 // We have some kernels that implement both prefill and decode modes in a single kernel (with different template instantiations). The following enum helps to distinguish the modes.
 enum class SparseAttnFwdMode {
     Prefill,            // Normal prefill mode
