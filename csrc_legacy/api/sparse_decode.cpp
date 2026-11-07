@@ -1,4 +1,5 @@
 #include "common.h"
+#include "sparse_decode_sched.h"
 
 #include "kernels/params.h"
 
@@ -48,7 +49,7 @@ class DecodeImplBase : public ImplBase<
     DecodeFeatures
 > {
 public:
-    virtual DecodeImplMeta get_meta(int h_q, int s_q) = 0;
+    virtual DecodeImplMeta get_meta(int b, int h_q, int s_q) = 0;
 };
 
 class Decode_Sm90_Impl : public DecodeImplBase {
@@ -67,7 +68,7 @@ class Decode_Sm90_Impl : public DecodeImplBase {
     )
 
 public:
-    DecodeImplMeta get_meta(int h_q, int s_q) override {
+    DecodeImplMeta get_meta(int b, int h_q, int s_q) override {
         Arch arch = Arch();
         return {
             std::max(arch.num_sms / s_q / (h_q/64), 1),
@@ -86,9 +87,11 @@ protected:
     }
 };
 
+// Any h_q in [1, 128]: one launch with one CTA per block of 64 heads (blockIdx.z), padding rows are not stored
 class Decode_Sm100_Head64_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_64,
+        DecodeFeatures::HEAD_128,
         DecodeFeatures::HEAD_DIM_512,
         DecodeFeatures::HEAD_DIM_576,
         DecodeFeatures::V32_KVCACHE_FORMAT,
@@ -105,10 +108,10 @@ class Decode_Sm100_Head64_Impl : public DecodeImplBase {
                                              KVFormatPair<ModelType::V41>, KVFormatPair<ModelType::V41, ModelType::V41_FP4>>;
 
 public:
-    DecodeImplMeta get_meta(int h_q, int s_q) override {
+    DecodeImplMeta get_meta(int b, int h_q, int s_q) override {
         Arch arch = Arch();
         return {
-            std::max(arch.num_sms / s_q, 1),
+            sm100_sparse_decode_num_sm_parts(arch.num_sms, b, s_q, h_q),
             5,
             64
         };
@@ -118,62 +121,9 @@ protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
         dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
             DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
-                STD_TORCH_CHECK(params.h_q == 64, "Unsupported h_q: ", params.h_q);
+                STD_TORCH_CHECK(params.h_q >= 1 && params.h_q <= 128, "Unsupported h_q: ", params.h_q);
                 using legacy::sm100::decode::sparse::head64::Config;
                 legacy::sm100::decode::sparse::head64::run_flash_splitkv_mla_fp8_sparse_kernel<Config{MODEL_TYPE, EXTRA_MODEL_TYPE, ENABLE_SPLIT_KV}>(params);
-            }));
-        });
-    }
-};
-
-
-// An implementation that calls the head64 kernel twice to process head128
-// Necessary for running V3.2 shape (i.e. h = 128, d_qk = 576) on SM100f
-class Decode_Sm100_Head64x2_Impl : public DecodeImplBase {
-    DECLARE_SUPPORTED_FEATURES(
-        DecodeFeatures::HEAD_128,
-        DecodeFeatures::HEAD_DIM_512,
-        DecodeFeatures::HEAD_DIM_576,
-        DecodeFeatures::V32_KVCACHE_FORMAT,
-        DecodeFeatures::V32_NO_ROPE_KVCACHE_FORMAT,
-        DecodeFeatures::V4_KVCACHE_FORMAT,
-        DecodeFeatures::ATTN_SINK,
-        DecodeFeatures::TOPK_LENGTH,
-        DecodeFeatures::EXTRA_KVCACHE,
-        DecodeFeatures::EXTRA_TOPK_LENGTH
-    )
-    using SupportedKVFormats = KVFormatPairs<KVFormatPair<ModelType::V32>, KVFormatPair<ModelType::V32_NO_ROPE>, KVFormatPair<ModelType::V4>>;
-
-public:
-    DecodeImplMeta get_meta(int h_q, int s_q) override {
-        Arch arch = Arch();
-        return {
-            std::max(arch.num_sms / s_q, 1),
-            5,
-            64
-        };
-    }
-
-protected:
-    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
-        dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
-            DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
-                for (int start_head_idx = 0; start_head_idx < 128; start_head_idx += 64) {
-                    SparseAttnDecodeParams cur_params = params;
-                    cur_params.q += start_head_idx * params.stride_q_h_q;
-                    if (cur_params.attn_sink) {
-                        cur_params.attn_sink += start_head_idx;
-                    }
-                    cur_params.lse += start_head_idx;
-                    cur_params.out += start_head_idx * params.stride_o_h_q;
-                    if (cur_params.enable_split_kv) {
-                        cur_params.lse_accum += start_head_idx;
-                        cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
-                    }
-                    cur_params.h_q = 64;
-                    using legacy::sm100::decode::sparse::head64::Config;
-                    legacy::sm100::decode::sparse::head64::run_flash_splitkv_mla_fp8_sparse_kernel<Config{MODEL_TYPE, EXTRA_MODEL_TYPE, ENABLE_SPLIT_KV}>(cur_params);
-                }
             }));
         });
     }
@@ -196,7 +146,7 @@ class Decode_Sm100_Head128_Impl : public DecodeImplBase {
                                              KVFormatPair<ModelType::V41, ModelType::V41_FP4>>;
 
 public:
-    DecodeImplMeta get_meta(int h_q, int s_q) override {
+    DecodeImplMeta get_meta(int b, int h_q, int s_q) override {
         Arch arch = Arch();
         return {
             std::max(arch.num_sms / s_q / 2, 1),
@@ -238,7 +188,9 @@ sparse_attn_decode_interface(
     // Names the format of `kv` ("V32", "V32_NO_ROPE", "V4", "V41"). Only needed to disambiguate V3.2-no-RoPE from V4.1,
     // which have the same d_qk and bytes per token; when omitted the format is detected from the shape and 528 B per
     // token means V4.1, as in upstream FlashMLA.
-    const std::optional<std::string> &kv_format
+    const std::optional<std::string> &kv_format,
+    // > 0: token packing, see SparseAttnDecodeParams::heads_per_group
+    int64_t heads_per_group
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -369,9 +321,9 @@ sparse_attn_decode_interface(
     Tensor lse = torch::stable::new_empty(q, {b, s_q, h_q}, ScalarType::Float);
 
     std::vector<DecodeFeatures> features;
-    if (h_q == 64) {
+    if (arch.is_sm100f() ? (h_q >= 1 && h_q <= 64) : h_q == 64) {
         features.push_back(DecodeFeatures::HEAD_64);
-    } else if (h_q == 128) {
+    } else if (arch.is_sm100f() ? (h_q > 64 && h_q <= 128) : h_q == 128) {
         features.push_back(DecodeFeatures::HEAD_128);
     } else {
         STD_TORCH_CHECK(false, "Unsupported h_q: ", h_q);
@@ -411,20 +363,22 @@ sparse_attn_decode_interface(
         }
     }
 
+    STD_TORCH_CHECK(heads_per_group >= 0, "heads_per_group must be >= 0");
+    if (heads_per_group > 0) {
+        STD_TORCH_CHECK(arch.is_sm100f() && h_q <= 64 && model_type == ModelType::V32 && !have_extra_kcache,
+                        "token packing (heads_per_group > 0) needs SM100, h_q <= 64, V32 kv and no extra kv");
+        STD_TORCH_CHECK(h_q <= heads_per_group * SPARSE_DECODE_MAX_GROUPS, "h_q exceeds ", SPARSE_DECODE_MAX_GROUPS,
+                        " groups of heads_per_group heads");
+    }
+
     DecodeImplBase* impl;
     if (arch.is_sm100f()) {
-        if (h_q == 64) {
-            impl = new Decode_Sm100_Head64_Impl();
-        } else if (h_q == 128) {
-            if (d_qk == 576 || model_type == ModelType::V32_NO_ROPE) {
-                impl = new Decode_Sm100_Head64x2_Impl();
-            } else if (d_qk == 512) {
-                impl = new Decode_Sm100_Head128_Impl();
-            } else {
-                STD_TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
-            }
+        // The native head128 kernel covers d_qk == 512 with exactly 128 heads; every other h_q <= 128 runs the head64
+        // kernel once over ceil(h_q/64) head blocks (this used to be two sequential head64 launches for h_q == 128)
+        if (h_q == 128 && d_qk == 512 && model_type != ModelType::V32_NO_ROPE) {
+            impl = new Decode_Sm100_Head128_Impl();
         } else {
-            STD_TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+            impl = new Decode_Sm100_Head64_Impl();
         }
     } else if (arch.is_sm90a()) {
         impl = new Decode_Sm90_Impl();
@@ -432,7 +386,7 @@ sparse_attn_decode_interface(
         STD_TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
     }
 
-    DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
+    DecodeImplMeta impl_meta = impl->get_meta(b, h_q, s_q);
 
     SparseAttnDecodeParams params = {
         b, s_q, h_q, h_kv, d_qk, (int)d_v,
@@ -467,6 +421,7 @@ sparse_attn_decode_interface(
 
         enable_split_kv,
     };
+    params.heads_per_group = (int)heads_per_group;
 
     Tensor o_accum, lse_accum;
     if (enable_split_kv) {

@@ -18,6 +18,7 @@
 #include <cutlass/fast_math.h>
 
 #include "api/common.h"
+#include "api/sparse_decode_sched.h"
 #include "kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 
 std::vector<Tensor> get_mla_decoding_metadata(
@@ -59,8 +60,8 @@ std::vector<Tensor> get_mla_decoding_metadata(
     int num_sm_parts;
     if (topk_int.has_value()) {
         if (arch.is_sm100f()) {
-            // sm100 sparse kernels use a larger split count envelope.
-            num_sm_parts = std::max(arch.num_sms / s_q, 1);
+            // Must match the decode kernel's partitions, see sm100_sparse_decode_num_sm_parts
+            num_sm_parts = sm100_sparse_decode_num_sm_parts(arch.num_sms, batch_size, s_q, num_heads_q);
         } else {
             const int heads_per_64 = std::max(1, num_heads_q / 64);
             num_sm_parts = std::max(arch.num_sms / s_q / heads_per_64, 1);
@@ -99,12 +100,29 @@ std::vector<Tensor> get_mla_decoding_metadata(
     return {tile_scheduler_metadata, num_splits};
 }
 
+// Number of rows of the tile scheduler metadata the sparse decode kernel expects for (b, s_q, h_q), for callers
+// that fill the schedule themselves (FlashMLASchedMeta with precomputed tensors)
+int64_t sparse_decode_num_sm_parts(const int64_t b, const int64_t s_q, const int64_t h_q) {
+    STD_TORCH_CHECK(b > 0 && s_q > 0 && h_q > 0, "b, s_q and h_q must be positive");
+    Arch arch;
+    if (arch.is_sm100f()) {
+        return sm100_sparse_decode_num_sm_parts(arch.num_sms, (int)b, (int)s_q, (int)h_q);
+    }
+    return std::max(arch.num_sms / (int)s_q / std::max(1, (int)h_q / 64), 1);
+}
+
 STABLE_TORCH_LIBRARY_FRAGMENT(flash_mla_legacy, m) {
     m.def(
         "get_mla_decoding_metadata(Tensor seqlens_k, int num_q_tokens_per_head_k, int h_k, "
         "int? h_q, bool is_fp8_kvcache, int? topk) -> Tensor[]");
+    m.def("sparse_decode_num_sm_parts(int b, int s_q, int h_q) -> int");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(flash_mla_legacy, CUDA, m) {
     m.impl("get_mla_decoding_metadata", TORCH_BOX(&get_mla_decoding_metadata));
+}
+
+// No tensor arguments, so there is no CUDA key to dispatch on
+STABLE_TORCH_LIBRARY_IMPL(flash_mla_legacy, CompositeExplicitAutograd, m) {
+    m.impl("sparse_decode_num_sm_parts", TORCH_BOX(&sparse_decode_num_sm_parts));
 }

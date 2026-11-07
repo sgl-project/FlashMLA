@@ -129,6 +129,32 @@ def gen_testcase() -> List[RawTestParam]:
                 for is_varlen in [True]
             ])
 
+    # Head counts other than 64 and 128 (e.g. Kimi-K3.1's 96, or what TP leaves of it) run the head64 kernel over
+    # ceil(h_q/64) blocks of 64 heads; only SM100f supports them
+    if supports_v41:
+        correctness_cases.extend([
+            RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,
+                         have_topk_length=d_qk == 512,
+                         enable_attn_sink=True,
+                         extra_s_k=extra_s_k,
+                         extra_topk=extra_topk,
+                         block_size=block_size,
+                         extra_block_size=extra_block_size,
+                         d_qk=d_qk,
+                         check_correctness=True,
+                         num_runs=0)
+            for h_q in [8, 32, 96]
+            for d_qk, (extra_s_k, extra_topk, extra_block_size) in [
+                (576, (None, None, None)),
+                (512, (None, None, None)),
+                (512, (650, 576, 53)),
+            ]
+            for (s_k, topk, block_size) in [(512, 64, 64), (1024, 576, 61), (2046, 2048, 576)]
+            for b in [1, 4, 74]
+            for s_q in [1, 3]
+            for is_varlen in [True]
+        ])
+
     # DeepSeek-V3.2 without RoPE: like V3.2 (no extra KV cache, no dynamic topk length) but d_qk == 512
     correctness_cases.extend([
         RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,

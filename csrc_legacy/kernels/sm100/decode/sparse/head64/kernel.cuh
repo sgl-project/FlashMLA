@@ -1,7 +1,8 @@
 /*
-Sparse MLA Decoding — SM100, h_q == 64
+Sparse MLA Decoding — SM100, h_q <= 128 in blocks of 64 heads
 
-Decoding kernel for h_q == 64 heads. Uses FP8 KV cache with dequantization,
+Decoding kernel for h_q <= 128 heads: blockIdx.z selects a block of 64 heads, rows past h_q are padding (zero-filled
+on load, not stored). Uses FP8 KV cache with dequantization,
 UTCMMA/TMEM architecture, and TMA for data transfers. Supports split-KV partitioning
 for large topk values. Config defines per-model-type dimensions (V3.2: d_qk=576,
 V4: d_qk=512, RoPE bf16, tile_size=64; V4.1: d_qk=512, RoPE fp8, tile_size=32).
@@ -44,6 +45,7 @@ KernelTemplate<CONFIG>
     const int idx_in_warpgroup = threadIdx.x % 128;
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int lane_idx = threadIdx.x % 32;
+    const int head_off = blockIdx.z * B_H;   // First head of this CTA's head block
 
     extern __shared__ char wksp_buf[];
     SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
@@ -180,9 +182,12 @@ KernelTemplate<CONFIG>
 
         // NOTE Padding rows (idx%B_H >= h_q) must not read
         // attn_sink (OOB); their output is discarded anyway.
-        float attn_sink = (params.attn_sink == nullptr || idx_in_warpgroup%B_H >= params.h_q)
-            ? -CUDART_INF_F : __ldg((float*)params.attn_sink + (idx_in_warpgroup%B_H)) * CUDART_L2E_F;
+        float attn_sink = (params.attn_sink == nullptr || head_off + idx_in_warpgroup%B_H >= params.h_q)
+            ? -CUDART_INF_F : __ldg((float*)params.attn_sink + head_off + (idx_in_warpgroup%B_H)) * CUDART_L2E_F;
         constexpr int NUM_ELEMS_PER_THREAD = B_TOPK / 2;
+        // Token packing: this thread's row belongs to token group (head / heads_per_group)
+        const int row_group = params.heads_per_group > 0
+            ? min((head_off + idx_in_warpgroup%B_H) / params.heads_per_group, SPARSE_DECODE_MAX_GROUPS-1) : 0;
         
         run_main_loop([&](const MainLoopArgs &args) {
             cute::tma_store_wait<0>();
@@ -208,7 +213,7 @@ KernelTemplate<CONFIG>
                     false
                 >(
                     tmem_cols::P,
-                    plan.is_token_valid[rs.index_buf_idx],
+                    plan.is_token_valid[rs.index_buf_idx][row_group],
                     warp_idx, lane_idx,
                     [&]() {},
                     plan.s_p.p_exchange_buf,
@@ -294,15 +299,16 @@ KernelTemplate<CONFIG>
             li += plan.rowwise_max_buf[idx_in_warpgroup^64];
 
             // Store li
-            if (idx_in_warpgroup < params.h_q) {
+            // Threads B_H..127 hold duplicates of rows 0..B_H-1; only the first B_H store, and only real heads
+            if (idx_in_warpgroup < B_H && head_off + idx_in_warpgroup < params.h_q) {
                 if (args.is_no_split) {
                     float cur_lse = fma(mi, CUDART_LN2_F, logf(li));
                     cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
-                    float* gSoftmaxLse = (float*)params.lse + args.batch_idx*params.stride_lse_b + s_q_idx*params.stride_lse_s_q + idx_in_warpgroup;
+                    float* gSoftmaxLse = (float*)params.lse + args.batch_idx*params.stride_lse_b + s_q_idx*params.stride_lse_s_q + head_off + idx_in_warpgroup;
                     *gSoftmaxLse = cur_lse;
                 } else {
                     float cur_lse = log2f(li) + mi;
-                    float* gSoftmaxLseAccum = (float*)params.lse_accum + args.n_split_idx*params.stride_lse_accum_split + s_q_idx*params.stride_lse_accum_s_q + idx_in_warpgroup;
+                    float* gSoftmaxLseAccum = (float*)params.lse_accum + args.n_split_idx*params.stride_lse_accum_split + s_q_idx*params.stride_lse_accum_s_q + head_off + idx_in_warpgroup;
                     *gSoftmaxLseAccum = cur_lse;
                 }
             }
@@ -320,7 +326,7 @@ KernelTemplate<CONFIG>
                 Tensor tma_gO = flat_divide(
                     tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx, args.batch_idx),
                     Shape<Int<B_H>, Int<64>>{}
-                )(_, _, _0{}, _);
+                )(_, _, blockIdx.z, _);
                 auto thr_tma = tma_params.tma_O.get_slice(_0{});
                 Tensor tma_sO = flat_divide(
                     sO,
@@ -388,10 +394,10 @@ KernelTemplate<CONFIG>
                     CUTE_UNROLL
                     for (int local_row = 0; local_row < B_H/4; ++local_row) {
                         int smem_row = local_row*4 + warp_idx;
-                        if (smem_row < params.h_q) {    // Don't write padding rows (o_accum only has h_q rows)
+                        if (head_off + smem_row < params.h_q) {    // Don't write padding rows (o_accum only has h_q rows)
                             SM90_BULK_COPY_S2G::copy(
                                 &sO(smem_row, _0{}),
-                                (float*)params.o_accum + args.n_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + smem_row*params.stride_o_accum_h_q,
+                                (float*)params.o_accum + args.n_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + (head_off + smem_row)*params.stride_o_accum_h_q,
                                 D_V*sizeof(float)
                             );
                         }
@@ -417,7 +423,11 @@ KernelTemplate<CONFIG>
                 }
                 // Issue Q (SW128) G->S
                 {
-                    Tensor gQ = tma_params.tma_Q_SW128.get_tma_tensor(tma_params.shape_Q_SW128)(_, _, s_q_idx, args.batch_idx);
+                    Tensor gQ = local_tile(
+                        tma_params.tma_Q_SW128.get_tma_tensor(tma_params.shape_Q_SW128)(_, _, s_q_idx, args.batch_idx),
+                        Shape<Int<B_H>, Int<D_Q_SW128>>{},
+                        make_coord(blockIdx.z, _0{})
+                    );
                     Tensor sQ = make_tensor(make_smem_ptr(plan.u.qo.q.data()), SmemLayoutQ_SW128{});
                     ku::launch_tma_copy(
                         tma_params.tma_Q_SW128,
@@ -434,7 +444,7 @@ KernelTemplate<CONFIG>
                         (uint64_t*)&plan.bar_q_tma,
                         (uint64_t)TMA::CacheHintSm90::EVICT_FIRST,
                         plan.u.qo.q_sw64,
-                        0, 0, 0,
+                        0, head_off, 0,
                         s_q_idx, args.batch_idx
                     );
                 }
@@ -568,7 +578,8 @@ KernelTemplate<CONFIG>
         } else if (warp_idx == 5 && elect_one_sync()) {
             // Raw (quantized) KV retrieval warp
             run_main_loop([&](const MainLoopArgs &args) {
-                plan.bar_q_utccp.wait(args.bar_phase_batch_rel);
+                // raw_quant never overlaps Q (see the static_assert in SharedMemoryPlan), only the O buffers of the previous
+                // batch, so the gathers need not wait for Q's UTCCP; starting them early shortens each CTA's first block
                 plan.bar_last_store_done.wait(args.bar_phase_batch_rel);
                 for_each_kv_block<OrigKVFormat, ExtraKVFormat>(args.start_block_idx, args.end_block_idx, args.num_orig_kv_blocks, [&]<typename F>(int block_idx, bool is_extra_block) {
                     plan.bar_valid_coord_scale_ready[rs.index_buf_idx].wait(rs.index_bar_phase);
@@ -668,6 +679,13 @@ KernelTemplate<CONFIG>
                 };
                 auto process_one_block = [&](int block_idx, int2 my_indices, auto is_extra_block_t) {
                     static constexpr bool IS_EXTRA_BLOCK = std::is_same_v<decltype(is_extra_block_t), IsExtraBlock>;
+                    // Token packing: bits 26..30 of a valid index say which token groups attend to it
+                    int group_bits[2] = {0, 0};
+                    if (params.heads_per_group > 0) {
+                        constexpr int SLOT_MASK = (1 << SPARSE_DECODE_GROUP_SHIFT) - 1;
+                        if (my_indices.x != -1) { group_bits[0] = (unsigned)my_indices.x >> SPARSE_DECODE_GROUP_SHIFT; my_indices.x &= SLOT_MASK; }
+                        if (my_indices.y != -1) { group_bits[1] = (unsigned)my_indices.y >> SPARSE_DECODE_GROUP_SHIFT; my_indices.y &= SLOT_MASK; }
+                    }
                     using F = std::conditional_t<IS_EXTRA_BLOCK, ExtraKVFormat, OrigKVFormat>;
                     int cur_block_size = IS_EXTRA_BLOCK ? params.extra_page_block_size : params.page_block_size;
                     int64_t cur_k_block_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_block : params.stride_kv_block;
@@ -730,8 +748,21 @@ KernelTemplate<CONFIG>
                             copy_bytes<F::NUM_SCALES_EACH_TOKEN * F::SCALE_SMEM_BYTES>(plan.scales[rs.index_buf_idx][lane_idx*2 + i], scales[i]);
                     }
                     *(int2*)(plan.tma_coord[rs.index_buf_idx] + lane_idx*2) = *(int2*)tma_coords;
-                    if (lane_idx%4 == 0)
-                        plan.is_token_valid[rs.index_buf_idx][lane_idx/4] = valid_mask;
+                    if (params.heads_per_group == 0) {
+                        if (lane_idx%4 == 0)
+                            plan.is_token_valid[rs.index_buf_idx][0][lane_idx/4] = valid_mask;
+                    } else {
+                        // valid_mask holds this lane-quad's 8 keys; keep, per group, the keys that group attends to
+                        char my_valid = (valid_mask >> (lane_idx%4*2)) & 3;
+                        CUTE_UNROLL
+                        for (int g = 0; g < SPARSE_DECODE_MAX_GROUPS; ++g) {
+                            char m = (my_valid & ((group_bits[0] >> g & 1) | (group_bits[1] >> g & 1) << 1)) << (lane_idx%4*2);
+                            m |= __shfl_xor_sync(0xFFFFFFFF, m, 0x1);
+                            m |= __shfl_xor_sync(0xFFFFFFFF, m, 0x2);
+                            if (lane_idx%4 == 0)
+                                plan.is_token_valid[rs.index_buf_idx][g][lane_idx/4] = m;
+                        }
+                    }
                     
                     plan.bar_valid_coord_scale_ready[rs.index_buf_idx].arrive();
                     rs.update();
@@ -815,15 +846,15 @@ template<Config CONFIG>
 void KernelTemplate<CONFIG>::run(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.topk % B_TOPK == 0, "topk (%d) mod B_TOPK (%d) must be 0", params.topk, B_TOPK);
     KU_ASSERT(params.extra_topk % B_TOPK == 0, "extra_topk (%d) mod B_TOPK (%d) must be 0", params.extra_topk, B_TOPK);
-    KU_ASSERT(params.h_q == 64);
+    KU_ASSERT(params.h_q >= 1 && params.h_q <= 2*B_H);
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.d_qk == D_Q);
     KU_ASSERT(params.d_v == D_V);
     KU_ASSERT(params.model_type == OrigKVFormat::MODEL_TYPE && params.extra_model_type == ExtraKVFormat::MODEL_TYPE);
 
-    // NOTE The head dim of the gmem shape is h_q while the smem box covers
-    // B_H rows, so TMA zero-fills rows [h_q, B_H) on load (Q), and drops them on
-    // store (O). Same for tensor_map_q_sw64 below.
+    // NOTE The head dim of the gmem shape is h_q while each CTA's smem box covers
+    // B_H rows starting at blockIdx.z*B_H, so TMA zero-fills rows past h_q on load (Q),
+    // and drops them on store (O). Same for tensor_map_q_sw64 below.
     auto shape_Q_SW128 = make_shape(params.h_q, D_Q, params.s_q, params.b);
     auto tma_Q_SW128 = cute::make_tma_copy(
         SM90_TMA_LOAD{},
@@ -898,7 +929,7 @@ void KernelTemplate<CONFIG>::run(const SparseAttnDecodeParams &params) {
     
     
     // NOTE Don't use PDL because of potential compiler bugs!
-    mla_kernel<<<dim3(params.s_q, ENABLE_SPLITKV ? params.num_sm_parts : params.b, 1), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params, tma_params );
+    mla_kernel<<<dim3(params.s_q, ENABLE_SPLITKV ? params.num_sm_parts : params.b, ku::ceil_div(params.h_q, (int)B_H)), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params, tma_params );
     KU_CHECK_KERNEL_LAUNCH();
 
 }

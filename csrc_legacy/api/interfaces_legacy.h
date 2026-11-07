@@ -32,7 +32,9 @@ sparse_attn_decode_interface(
     // Names the layout of `kv` ("V32", "V32_NO_ROPE", "V4"). Only needed to tell V3.2-no-RoPE
     // apart from V4.1, which share 528 bytes per token; the current side never sees that
     // ambiguity because it only accepts the V4.1 formats.
-    const std::optional<std::string> &kv_format);
+    const std::optional<std::string> &kv_format,
+    // > 0: token packing, see SparseAttnDecodeParams::heads_per_group
+    int64_t heads_per_group);
 
 std::tuple<torch::stable::Tensor, torch::stable::Tensor, std::optional<torch::stable::Tensor>, std::optional<torch::stable::Tensor>>
 dense_attn_decode_interface(
@@ -122,6 +124,8 @@ std::vector<torch::stable::Tensor> get_mla_decoding_metadata(
     const std::optional<int64_t> h_q,
     const bool is_fp8_kvcache,
     const std::optional<int64_t> topk);
+
+int64_t sparse_decode_num_sm_parts(const int64_t b, const int64_t s_q, const int64_t h_q);
 
 std::vector<torch::stable::Tensor> fwd_kvcache_mla(
     torch::stable::Tensor &q,

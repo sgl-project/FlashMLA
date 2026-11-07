@@ -14,12 +14,14 @@
 STABLE_TORCH_LIBRARY(flash_mla_legacy, m) {
     // --- Sparse attention over the non-interleaved KV formats (V3.2, V3.2-no-RoPE, V4) ------
     // `kv_format` names the layout: V3.2-no-RoPE and V4.1 are both 528 bytes per token, so the
-    // shape alone cannot tell them apart.
+    // shape alone cannot tell them apart. `heads_per_group > 0` turns on token packing (SM100,
+    // V3.2 only), see SparseAttnDecodeParams::heads_per_group.
     m.def(
         "sparse_decode_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, "
         "Tensor? attn_sink, Tensor(a!)? tile_scheduler_metadata, Tensor(b!)? num_splits, "
         "Tensor? extra_kv, Tensor? extra_indices, Tensor? extra_topk_length, int d_v, "
-        "float sm_scale, str? kv_format=None) -> (Tensor, Tensor, Tensor(a)?, Tensor(b)?)");
+        "float sm_scale, str? kv_format=None, int heads_per_group=0) "
+        "-> (Tensor, Tensor, Tensor(a)?, Tensor(b)?)");
     // `return_stats=False` skips allocating and storing max_logits/lse, and both come back
     // None; `return_log2_stats=True` has the kernel emit them in base 2 instead of natural
     // logs, which is what the SGLang call sites have always been handed.
