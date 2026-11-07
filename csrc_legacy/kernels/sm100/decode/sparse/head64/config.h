@@ -33,7 +33,7 @@ enum NamedBarriers : uint32_t {
 template<Config CONFIG>
 struct KernelTemplate {
 
-static constexpr uint32_t B_H = 64;   // Head block size. This kernel only supports h_q == B_H
+static constexpr uint32_t B_H = 64;   // Head block size. One CTA per block of B_H heads (h_q <= 2*B_H)
 static constexpr bool ENABLE_SPLITKV = CONFIG.ENABLE_SPLITKV;
 
 using OrigKVFormat = KVCacheFormat<CONFIG.MODEL_TYPE>;         // Format of `kv`
@@ -208,7 +208,8 @@ struct SharedMemoryPlan {
         array_aligned<bf16, cosize_v<SmemLayoutS>> s;
     } s_p;
     CUTE_ALIGNAS(16) float rowwise_max_buf[128];
-    char is_token_valid[NUM_INDEX_BUFS][B_TOPK/8];
+    // Per key-validity bits of a block; with token packing one row of bits per token group (row group 0 otherwise)
+    alignas(8) char is_token_valid[NUM_INDEX_BUFS][SPARSE_DECODE_MAX_GROUPS][B_TOPK/8];
     int tma_coord[NUM_INDEX_BUFS][B_TOPK];
     CUTE_ALIGNAS(16) uint8_t scales[NUM_INDEX_BUFS][B_TOPK][SCALE_SMEM_STRIDE];   // bf16 (V3.2), ue8m0 (fp8) or e4m3 (fp4), see KVBlockDequantizer
     array_aligned<uint32_t, 1> tmem_start_addr;

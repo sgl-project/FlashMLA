@@ -85,6 +85,15 @@ def get_mla_decoding_metadata(
     ))
 
 
+def sparse_decode_num_sm_parts(b: int, s_q: int, h_q: int) -> int:
+    """Rows of the tile scheduler metadata that legacy sparse decoding expects for (b, s_q, h_q).
+
+    For callers that fill `FlashMLASchedMeta` themselves; `get_mla_decoding_metadata(...,
+    use_legacy=True)` already allocates this many rows.
+    """
+    return get_ops(True).sparse_decode_num_sm_parts(b, s_q, h_q)
+
+
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -107,11 +116,13 @@ def flash_mla_with_kvcache(
     kv_format: Optional[str] = None,
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
+    heads_per_group: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
         q: (batch_size, seq_len_q, num_heads_q, head_dim). bfloat16. `head_dim` must be 512 and
-                `num_heads_q` must be 64 or 128.
+                `num_heads_q` must be 64 or 128. The legacy sparse kernels on SM100 take any
+                `num_heads_q` in [1, 128].
         k_cache: (num_blocks, page_block_size, num_heads_k, bytes_per_token).
                 dtype must be torch.float8_e4m3fn, torch.int8 or torch.uint8, and `num_heads_k`
                 must be 1 (only MQA is supported).
@@ -145,6 +156,10 @@ def flash_mla_with_kvcache(
         enable_batch_invariant: bool. If True, the split-KV decoding path is disabled so that results do
                 not depend on how the batch is partitioned (`enable_batch_invariant=True` on the first
                 invocation must be kept on every reuse of the same `tile_scheduler_metadata`).
+        heads_per_group: int. Legacy sparse decoding only (SM100, V3.2 KV cache, num_heads_q <= 64, no
+                extra KV cache). If > 0, each q token packs up to 5 real tokens, `heads_per_group` heads each,
+                and bits 26..30 of every index say which of those tokens attend to it; see
+                SparseAttnDecodeParams::heads_per_group. 0 (the default) disables it.
 
     For DeepSeek V4.1:
         head_dim should be 512 while head_dim_v should be 512.
@@ -255,9 +270,10 @@ def flash_mla_with_kvcache(
             q, k_cache, indices_in_kvcache, topk_length, attn_sink,
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
             extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
-            head_dim_v, softmax_scale, kv_format
+            head_dim_v, softmax_scale, kv_format, heads_per_group
         )
     else:
+        assert heads_per_group == 0, "heads_per_group only applies to the legacy kernels"
         assert kv_format is None, (
             "kv_format only applies to the legacy kernels: the current ones accept the V4.1 "
             "formats only, so there is nothing to disambiguate"
