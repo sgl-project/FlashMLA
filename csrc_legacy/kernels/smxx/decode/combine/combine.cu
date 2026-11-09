@@ -1,5 +1,7 @@
 #include "combine.h"
 
+#include <cstdlib>
+
 #include <math_constants.h>
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
@@ -15,7 +17,8 @@ using namespace cute;
 
 namespace legacy::smxx::decode {
 
-template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
+// U > 1 keeps the loads of U splits in flight instead of one, for requests with many splits (see the launcher)
+template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS, int U>
 __global__ void __launch_bounds__(NUM_THREADS)
 flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     // grid_shape: [batch_size*s_q, 1, h_q/BLOCK_SIZE_M]
@@ -62,10 +65,15 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     static_assert(HEAD_DIM_V % (32*4) == 0);
     constexpr int ELEMS_PER_THREAD = HEAD_DIM_V / (32*4);
     float* oaccum_ptr = params.o_accum + start_split_idx*params.stride_o_accum_split + s_q_idx*params.stride_o_accum_s_q + (h_block_idx*BLOCK_SIZE_M + warp_idx)*params.stride_o_accum_h_q;
-    float4 datas[ELEMS_PER_THREAD];
+    float4 datas[U][ELEMS_PER_THREAD];
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-        datas[i] = *(float4*)(oaccum_ptr + lane_idx*4 + i*128); // NOTE We don't use __ldg here since it is incompatible with PDL
+    for (int u = 0; u < U; ++u) {
+        if (u < my_num_splits) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+                datas[u][i] = *(float4*)(oaccum_ptr + u*params.stride_o_accum_split + lane_idx*4 + i*128); // NOTE We don't use __ldg here since it is incompatible with PDL
+            }
+        }
     }
 
     // Warp #i gathers LseAccum for seq #i
@@ -127,21 +135,32 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
         for (int i = 0; i < ELEMS_PER_THREAD; ++i)
             result[i] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+        // Splits are accumulated in order, U at a time. All U loads of the next group are issued together after the
+        // current group is accumulated (interleaving each load with the accumulation it follows kept them from
+        // overlapping: measured no gain over U = 1)
         #pragma unroll 1
-        for (int split = 0; split < my_num_splits; ++split) {
-            float lse_scale = smem_buf[warp_idx][split];
-            // if (lse_scale != 0.f) {
+        for (int split0 = 0; split0 < my_num_splits; split0 += U) {
             CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
-                result[i].x += lse_scale * datas[i].x;
-                result[i].y += lse_scale * datas[i].y;
-                result[i].z += lse_scale * datas[i].z;
-                result[i].w += lse_scale * datas[i].w;
-                if (split != my_num_splits-1) {
-                    datas[i] = *(float4*)(oaccum_ptr + (split+1)*params.stride_o_accum_split + lane_idx*4 + i*128);
+            for (int u = 0; u < U; ++u) {
+                if (split0 + u < my_num_splits) {
+                    float lse_scale = smem_buf[warp_idx][split0 + u];
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+                        result[i].x += lse_scale * datas[u][i].x;
+                        result[i].y += lse_scale * datas[u][i].y;
+                        result[i].z += lse_scale * datas[u][i].z;
+                        result[i].w += lse_scale * datas[u][i].w;
+                    }
                 }
             }
-            // }
+            CUTLASS_PRAGMA_UNROLL
+            for (int u = 0; u < U; ++u) {
+                if (split0 + U + u < my_num_splits) {
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int i = 0; i < ELEMS_PER_THREAD; ++i)
+                        datas[u][i] = *(float4*)(oaccum_ptr + (split0 + U + u)*params.stride_o_accum_split + lane_idx*4 + i*128);
+                }
+            }
         }
         
         const int h_q_idx = h_block_idx*BLOCK_SIZE_M + warp_idx;
@@ -198,26 +217,37 @@ template<typename ElementT>
 void run_flash_mla_combine_kernel(CombineParams &params) {
     static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
     FLASH_ASSERT(params.d_v == HEAD_DIM_V);
-    MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
-        constexpr int BLOCK_SIZE_M = 8;
-        constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
-        constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
-        auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>;
-        CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
-        cudaLaunchAttribute attribute[1];
-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t combine_kernel_config = {
-            dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
-            dim3(NUM_THREADS, 1, 1),
-            0,
-            params.stream,
-            attribute,
-            1
-        };
-        CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
-    });
+    // Unrolling pays off only when requests have many splits (small batch, ~num_sm_parts / b splits each); with one
+    // or two splits per request the extra registers make it slower. FLASHMLA_COMBINE_UNROLL=1/4 forces either.
+    const char* env = std::getenv("FLASHMLA_COMBINE_UNROLL");
+    const bool unroll = env != nullptr ? std::atoi(env) > 1 : params.b * params.s_q * 4 <= params.num_sm_parts;
+    auto launch = [&]<int U>() {
+        MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
+            constexpr int BLOCK_SIZE_M = 8;
+            constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
+            constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
+            auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS, U>;
+            CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
+            cudaLaunchAttribute attribute[1];
+            attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attribute[0].val.programmaticStreamSerializationAllowed = 1;
+            cudaLaunchConfig_t combine_kernel_config = {
+                dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
+                dim3(NUM_THREADS, 1, 1),
+                0,
+                params.stream,
+                attribute,
+                1
+            };
+            CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+        });
+    };
+    if (unroll) {
+        launch.template operator()<4>();
+    } else {
+        launch.template operator()<1>();
+    }
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 

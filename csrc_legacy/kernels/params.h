@@ -106,7 +106,16 @@ struct SparseAttnDecodeParams {
     DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts, ], contiguous
     int* __restrict__ num_splits_ptr; // [batch_size+1, ], contiguous
     int num_sm_parts;
+
+    // Token packing (SM100 head64, V3.2 only): each q "token" holds several real tokens' heads, heads_per_group rows
+    // each, and an index carries in bits 26..30 which of those tokens attend to it (see SPARSE_DECODE_GROUP_SHIFT).
+    // 0 disables it.
+    int heads_per_group;
 };
+
+// Bit position of the token-group bits in a packed index; the slot itself must stay below 1 << 26
+static constexpr int SPARSE_DECODE_GROUP_SHIFT = 26;
+static constexpr int SPARSE_DECODE_MAX_GROUPS = 5;
 
 struct CombineParams {
     int b, s_q, h_q, d_v;
