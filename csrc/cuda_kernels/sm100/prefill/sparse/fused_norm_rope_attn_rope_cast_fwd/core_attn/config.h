@@ -122,6 +122,11 @@ static constexpr uint32_t OVERSIZED_SMEM_CAPACITY = 334848;
 //   holds the 128-dim chunks j, j + 2, and WG0 fills Q's rail j with the same dims
 // - one 32-bit TMEM word of the A operand holds 4 Q elements, a 16 B core-matrix row of S 16 tokens
 static constexpr bool QKV_FP8 = CONFIG.QKV_FP8;
+// QKV_FP8: S is computed as exp2(p * c - m + P_LOG2_SCALE), i.e. scaled by 4 before its e4m3 cast, so that fewer of its
+// small values fall into e4m3's subnormals or to zero. S <= 2^6 relative to the running max (the rescale threshold), so
+// 4 * S <= 256 stays below 448. li sums the scaled values, so O / li is unchanged; the row's max is published as
+// m - P_LOG2_SCALE to the epilogue, which uses it only for lse and the sink term
+static constexpr float P_LOG2_SCALE = QKV_FP8 ? 2.0f : 0.0f;
 static_assert(!QKV_FP8 || (FWD_MODE == SparseAttnFwdMode::Prefill && H_Q == 64 && !OVERSIZED_SMEM));
 using KVElem = std::conditional_t<QKV_FP8, fp8_e4m3, bf16>;   // The element of the KV slots and of S (UMMA operands)
 static constexpr uint32_t KV_CHUNK_ELEMS = 128 / sizeof(KVElem);       // Elements per 128 B swizzle-atom row of a KV slot

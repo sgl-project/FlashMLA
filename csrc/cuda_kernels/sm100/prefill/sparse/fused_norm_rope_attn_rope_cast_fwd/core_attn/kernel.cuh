@@ -1159,7 +1159,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 KVElem s[NUM_ELEMS_PER_THREAD];
                 float cur_sum;
                 if constexpr (QKV_FP8) {
-                    cur_sum = get_s_fp8_from_p<NUM_ELEMS_PER_THREAD>(s, p, score_multiplier, new_max);
+                    cur_sum = get_s_fp8_from_p<NUM_ELEMS_PER_THREAD>(s, p, score_multiplier, new_max - P_LOG2_SCALE);
                 } else {
                     cur_sum = get_s_from_p<NUM_ELEMS_PER_THREAD>((nv_bfloat162*)s, p, score_multiplier, new_max);
                 }
@@ -1198,7 +1198,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     uint32_t global_index = cur_job.s_q_idx * H_Q + cta_idx * H_Q_PER_CTA + idx_in_warpgroup;
                     params.max_logits[global_index] = real_mi * CUDART_LN2_F;
                 }
-                smem.rowwise_mi_buf[idx_in_warpgroup] = mi;
+                // li is 2^P_LOG2_SCALE times the sum of the unscaled S: undo it in the max the epilogue sees (-inf stays -inf)
+                smem.rowwise_mi_buf[idx_in_warpgroup] = P_LOG2_SCALE != 0.0f ? mi - P_LOG2_SCALE : mi;
             }
             smem.rowwise_li_buf[idx_in_warpgroup] = li;
             smem.bar_li_mi_full.arrive();
