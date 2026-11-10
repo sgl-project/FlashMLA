@@ -240,6 +240,16 @@ static constexpr uint32_t NUM_WORKING_THREADS =
 static constexpr uint32_t FOLD_FACTOR = 128 / H_Q_PER_CTA;
 static constexpr uint32_t NUM_MRGEMM_RAILS = 2; // The number of "rails" (batch size) during multi-rail GeMM. Currently must be 2
 static_assert(FOLD_FACTOR % NUM_MRGEMM_RAILS == 0);
+// QKV_FP8: single-rail QK. Both lane groups hold the WHOLE 512-dim Q (WG0 exchanges its two rail halves through
+// q_xchg_buf), and the QK GEMM is N = B_TOPK, K = D_QK: lane group g gets the N-slice g, i.e. the complete P of tokens
+// [g * B_TOPK / 2, +B_TOPK / 2). The softmax warpgroup then reads its 32 tokens straight from TMEM, without the cross-rail
+// P sum (16 KB of STS + 16 KB of LDS + a named barrier per block on the softmax's critical path). The cost is on the
+// tensor pipe (16 N = 64 instructions instead of 8 N = 128) and in TMEM (Q 128 columns instead of 64)
+#ifndef FMLA_FP8_SINGLE_RAIL_QK
+#define FMLA_FP8_SINGLE_RAIL_QK 1
+#endif
+static constexpr bool QK_SINGLE_RAIL = QKV_FP8 && (FMLA_FP8_SINGLE_RAIL_QK != 0);
+static constexpr uint32_t QK_RAILS = QK_SINGLE_RAIL ? 1 : NUM_MRGEMM_RAILS;   // rails of the QK GEMM
 static constexpr uint32_t NUM_P_ELEMS_PER_THREAD = H_Q_PER_CTA * B_TOPK / 128;
 // O epilogue tiles per job: (D_VO / FOLD_FACTOR) columns of O per thread in tiles of O_QUANT_TILE_SIZE
 static constexpr uint32_t NUM_EPILOGUE_TILES = D_VO / FOLD_FACTOR / O_QUANT_TILE_SIZE;
@@ -270,8 +280,8 @@ struct tmem_cols {
     // P: B_TOPK x NUM_MRGEMM_RAILS fp32 per lane group = 64 columns each
     static constexpr uint32_t O = 0;
     static constexpr uint32_t Q = O + D_VO / FOLD_FACTOR;
-    static constexpr uint32_t P_0 = Q + D_QK / NUM_MRGEMM_RAILS / Q_ELEMS_PER_TMEM_WORD;
-    static constexpr uint32_t P_1 = P_0 + B_TOPK*NUM_MRGEMM_RAILS/FOLD_FACTOR;
+    static constexpr uint32_t P_0 = Q + D_QK / QK_RAILS / Q_ELEMS_PER_TMEM_WORD;
+    static constexpr uint32_t P_1 = P_0 + B_TOPK*QK_RAILS/FOLD_FACTOR;
 
     static constexpr uint32_t get_p(const uint32_t &p_buf_idx) {
         if constexpr (NUM_P_BUFS == 1) {
@@ -282,7 +292,7 @@ struct tmem_cols {
             static_assert(NUM_P_BUFS == 1 || NUM_P_BUFS == 2);
         }
     }
-    static_assert(get_p(NUM_P_BUFS-1) + B_TOPK*NUM_MRGEMM_RAILS/FOLD_FACTOR <= 512);
+    static_assert(get_p(NUM_P_BUFS-1) + B_TOPK*QK_RAILS/FOLD_FACTOR <= 512);
 };
 
 using MMAAtom_QK = cute::conditional_t<
@@ -290,7 +300,7 @@ using MMAAtom_QK = cute::conditional_t<
     SM100_MMA_F16BF16_2x1SM_TS_NOELECT<bf16, bf16, float, MMA_M, B_TOPK * NUM_MRGEMM_RAILS, UMMA::Major::K, UMMA::Major::K>,
     cute::conditional_t<
         QKV_FP8,
-        SM100_MMA_F8F6F4_WS_TS_NOELECT<fp8_e4m3, fp8_e4m3, float, MMA_M, B_TOPK * NUM_MRGEMM_RAILS, UMMA::Major::K, UMMA::Major::K>,
+        SM100_MMA_F8F6F4_WS_TS_NOELECT<fp8_e4m3, fp8_e4m3, float, MMA_M, B_TOPK * QK_RAILS, UMMA::Major::K, UMMA::Major::K>,
         SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, MMA_M, B_TOPK * NUM_MRGEMM_RAILS, UMMA::Major::K, UMMA::Major::K>
     >
 >;
@@ -313,13 +323,20 @@ struct SharedMemoryPlan {
     CUTE_ALIGNAS(1024) KVElem kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
     CUTE_ALIGNAS(1024) KVElem s[H_Q_PER_CTA * B_TOPK];
     CUTE_ALIGNAS(128) bf16 q_half_buf[STAGE_Q ? H_Q * D_QK / 2 : 0];
-    CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
+    CUTE_ALIGNAS(1024) float p_exchange_buf[QK_SINGLE_RAIL ? 1 : 4][32*NUM_P_ELEMS_PER_THREAD];   // QK_SINGLE_RAIL: unused
+    // QK_SINGLE_RAIL: WG0's e4m3 Q halves, [16 B chunk][thread] so that both the stores and the partner's loads are
+    // conflict-free (consecutive threads, consecutive 16 B)
+    CUTE_ALIGNAS(128) uint8_t q_xchg_buf[QK_SINGLE_RAIL ? 128 * D_QK / NUM_MRGEMM_RAILS : 0];
     CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
     // Decode: WG10 produces metadata once for the four dequant warps. 16 B aligned so that the fp4 path can read
     // the coordinates of 4 consecutive rows with one LDS.128
     CUTE_ALIGNAS(16) int decode_tma_coords[IS_DECODE ? NUM_INDICES_BUFS : 0][B_TOPK];
     float q_sqr_sum_buf[ENABLE_Q_NORM ? 2 : 0][128];    // We have 2 q_sqr_sum_buf to save some barriers, as Q[i+2] starts to fetch -> O[i] have finished -> Q[i]'s q_sqr_sum_buf is useless
-    float rowwise_max_buf[128];
+    // QK_SINGLE_RAIL: two buffers, alternating with the softmax's global block counter. Without the cross-rail exchange no
+    // barrier orders the partner warp's read of block k before this warp's write of block k + 1; with two buffers the write
+    // of block k + 2 comes after block k + 1's pair barrier, which the partner reaches only after its read of block k
+    // (found with compute-sanitizer racecheck)
+    float rowwise_max_buf[QK_SINGLE_RAIL ? 2 : 1][128];
     float rowwise_mi_buf[H_Q_PER_CTA];
     float rowwise_li_buf[128];    // 128: warpgroup size
 

@@ -719,10 +719,54 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 }
             }
 
+            if constexpr (QK_SINGLE_RAIL) {
+                // Both lane groups need the whole e4m3 Q of their head (config.h): cast this thread's rail half, swap it with
+                // the thread of the other rail (idx ^ 64) through q_xchg_buf, and store all 512 dims, in dim order, to TMEM.
+                // The swap is before the tQ_empty wait, so it overlaps the previous job's QK like the loads above
+                static constexpr uint32_t HALF = D_QK / NUM_MRGEMM_RAILS;   // e4m3 of one rail (256 B)
+                static constexpr uint32_t NUM_CHUNKS = HALF / 16;
+                fp8_e4m3 own[HALF];
+                CUTE_UNROLL
+                for (uint32_t i = 0; i < HALF; i += 2) {
+                    float2 x = __bfloat1622float2(*(nv_bfloat162*)(cached_q + i));
+                    *(__nv_fp8x2_storage_t*)(own + i) =
+                        __nv_cvt_float2_to_fp8x2(x, __NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
+                }
+                uint4 partner[NUM_CHUNKS];
+                CUTE_UNROLL
+                for (uint32_t c = 0; c < NUM_CHUNKS; ++c) {
+                    ku::st_shared(smem.q_xchg_buf + (c * 128 + idx_in_warpgroup) * 16, *(__int128_t*)(own + c * 16));
+                }
+                NamedBarrier::arrive_and_wait(128, barrier_ids::WG0_SYNC);
+                CUTE_UNROLL
+                for (uint32_t c = 0; c < NUM_CHUNKS; ++c) {
+                    partner[c] = *(const uint4*)(smem.q_xchg_buf + (c * 128 + (idx_in_warpgroup ^ 64)) * 16);
+                }
+                NamedBarrier::arrive_and_wait(128, barrier_ids::WG0_SYNC);   // the next job's stores overwrite q_xchg_buf
+
+                smem.bar_tQ_empty.wait(cur_job.job_idx_mod_2^1);
+                ku::tcgen05_after_thread_sync();
+                // The rail view of rail j is the 128-dim chunks j, j + 2 (config.h); chunk c of the dims is 32 TMEM columns
+                static constexpr uint32_t CHUNK_COLS = 128 / Q_ELEMS_PER_TMEM_WORD;
+                if (rail == 0) {
+                    ku::tmem_st_32dp32bNx<CHUNK_COLS>(tmem_cols::Q + 0 * CHUNK_COLS, own);
+                    ku::tmem_st_32dp32bNx<CHUNK_COLS>(tmem_cols::Q + 1 * CHUNK_COLS, partner);
+                    ku::tmem_st_32dp32bNx<CHUNK_COLS>(tmem_cols::Q + 2 * CHUNK_COLS, own + 128);
+                    ku::tmem_st_32dp32bNx<CHUNK_COLS>(tmem_cols::Q + 3 * CHUNK_COLS, partner + NUM_CHUNKS / 2);
+                } else {
+                    ku::tmem_st_32dp32bNx<CHUNK_COLS>(tmem_cols::Q + 0 * CHUNK_COLS, partner);
+                    ku::tmem_st_32dp32bNx<CHUNK_COLS>(tmem_cols::Q + 1 * CHUNK_COLS, own);
+                    ku::tmem_st_32dp32bNx<CHUNK_COLS>(tmem_cols::Q + 2 * CHUNK_COLS, partner + NUM_CHUNKS / 2);
+                    ku::tmem_st_32dp32bNx<CHUNK_COLS>(tmem_cols::Q + 3 * CHUNK_COLS, own + 128);
+                }
+            } else {
             smem.bar_tQ_empty.wait(cur_job.job_idx_mod_2^1);
             ku::tcgen05_after_thread_sync();
-            
-            if constexpr (QKV_FP8) {
+            }
+
+            if constexpr (QK_SINGLE_RAIL) {
+                // stored above
+            } else if constexpr (QKV_FP8) {
                 // Cast to e4m3 right before the TMEM store, a pair at a time: bf16x2 -> f32x2 (exact) -> one
                 // cvt.rn.satfinite.e4m3x2.f32. One 32-bit TMEM word holds 4 e4m3 with k increasing inside the word
                 fp8_e4m3 cached_q_fp8[NUM_CACHED_Q_BF16_PER_THREAD];
@@ -1109,6 +1153,21 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 ku::tcgen05_after_thread_sync();
 
                 float p[NUM_ELEMS_PER_THREAD];
+                if constexpr (QK_SINGLE_RAIL) {
+                    // The lane group of this warp holds the complete P of its token slice (config.h): one TMEM load, no
+                    // cross-rail sum. Masking as in retrieve_mask_and_reduce_p, including its all-valid fast path
+                    static_assert(NUM_ELEMS_PER_THREAD == 32 && !NEED_TP_EMPTY_BAR);
+                    ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(tmem_cols::get_p(p_buf_idx), p);
+                    const uint32_t mask_word = *(const uint32_t*)((const char*)&smem.is_k_valid[indices_buf_idx] + token_slice * (NUM_ELEMS_PER_THREAD / 8));
+                    cutlass::arch::fence_view_async_tmem_load();
+                    // __all_sync: every lane reaches here and mask_word is warp-uniform (see retrieve_mask_and_reduce_p)
+                    if (!__all_sync(0xffffffffu, mask_word == 0xffffffffu)) {
+                        CUTE_UNROLL
+                        for (int i = 0; i < (int)NUM_ELEMS_PER_THREAD; ++i) {
+                            if (!(mask_word >> i & 1)) p[i] = -CUDART_INF_F;
+                        }
+                    }
+                } else {
                 retrieve_mask_and_reduce_p<
                     H_Q_PER_CTA,
                     NUM_ELEMS_PER_THREAD,
@@ -1127,6 +1186,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     smem.p_exchange_buf,
                     p
                 );
+                }
 
 
                 float cur_pi_max = get_max<NUM_ELEMS_PER_THREAD>(p);
@@ -1134,12 +1194,15 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
 
                 // Row max over the lane groups holding the head's other token slices: the partner warp (w ^ 2, a 64-thread
                 // barrier per pair). max is exact in any order
-                smem.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
+                // The global block counter of rs, not kv_block_idx: that restarts per job, and a job with an odd number of blocks
+                // would put its last block and the next job's first block in the same buffer
+                const uint32_t max_buf_idx = QK_SINGLE_RAIL ? rs.get<2>().first : 0u;
+                smem.rowwise_max_buf[max_buf_idx][idx_in_warpgroup] = cur_pi_max;
                 NamedBarrier::arrive_and_wait(32 * FOLD_FACTOR, barrier_ids::WG3_WARP02_SYNC + (local_warp_idx & 1));
                 smem.bar_indices_empty[indices_buf_idx].arrive();   // Put it here to give the compiler more room for code reordering
                 CUTE_UNROLL
                 for (uint32_t g = 1; g < FOLD_FACTOR; ++g) {
-                    cur_pi_max = max(cur_pi_max, smem.rowwise_max_buf[idx_in_warpgroup ^ (g * H_Q_PER_CTA)]);
+                    cur_pi_max = max(cur_pi_max, smem.rowwise_max_buf[max_buf_idx][idx_in_warpgroup ^ (g * H_Q_PER_CTA)]);
                 }
                 real_mi = max(real_mi, cur_pi_max);
                 bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
@@ -1213,9 +1276,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             auto tiled_mma_qk = TiledMMA_QK{};
             auto tiled_mma_sv = TiledMMA_SV{};
             Tensor tQ = tiled_mma_qk.get_slice(_0{}).make_fragment_A(
-                partition_shape_A(tiled_mma_qk, Shape<Int<H_Q_PER_CTA>, Int<D_QK / NUM_MRGEMM_RAILS>>{})
+                partition_shape_A(tiled_mma_qk, Shape<Int<H_Q_PER_CTA>, Int<D_QK / QK_RAILS>>{})
             );
-            Tensor tP = partition_fragment_C(tiled_mma_qk, Shape<Int<H_Q_PER_CTA>, Int<B_TOPK * NUM_MRGEMM_RAILS>>{});
+            Tensor tP = partition_fragment_C(tiled_mma_qk, Shape<Int<H_Q_PER_CTA>, Int<B_TOPK * QK_RAILS>>{});
             Tensor sS = make_tensor(
                 make_smem_ptr(smem.s),
                 ku::make_umma_canonical_k_major_layout<H_Q_PER_CTA, B_TOPK, 0, KVElem>()
@@ -1232,7 +1295,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 auto kv_slot_idx = rs_qk.get<NUM_KV_SLOTS>().first;
                 Tensor sK = make_tensor(
                     make_smem_ptr(smem.kv_slots[kv_slot_idx]),
-                    ku::make_umma_canonical_k_major_layout<B_TOPK / CLUSTER_SIZE * NUM_MRGEMM_RAILS, D_QK / NUM_MRGEMM_RAILS, 128, KVElem>()
+                    ku::make_umma_canonical_k_major_layout<B_TOPK / CLUSTER_SIZE * QK_RAILS, D_QK / QK_RAILS, 128, KVElem>()
                 );
                 auto p_buf_idx = rs_qk.get<NUM_P_BUFS>().first;
                 tP.data().get() = tmem_cols::get_p(p_buf_idx);
