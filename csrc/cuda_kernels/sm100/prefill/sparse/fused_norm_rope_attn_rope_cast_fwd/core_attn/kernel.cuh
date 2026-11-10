@@ -728,9 +728,16 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 fp8_e4m3 own[HALF];
                 CUTE_UNROLL
                 for (uint32_t i = 0; i < HALF; i += 2) {
-                    float2 x = __bfloat1622float2(*(nv_bfloat162*)(cached_q + i));
-                    *(__nv_fp8x2_storage_t*)(own + i) =
-                        __nv_cvt_float2_to_fp8x2(x, __NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
+                    // One F2FP per pair straight from bf16x2 (the bf16 -> f32 step is exact, so the result is the same as
+                    // the f32 route, which costs two more instructions per pair: an fp8 job casts 256 elements per thread).
+                    // cvt.rn.satfinite.e4m3x2.bf16x2 is accepted by ptxas only for the family-specific targets (sm_100a /
+                    // sm_103a / sm_107a) and rejected for plain sm_100; these kernels are built for the "a" targets only.
+                    // Checked on all 2^24 bf16 pairs against the bf16 -> f32 -> e4m3 route: no
+                    // difference, including +-inf and |x| > 448 saturating to +-448, NaN staying NaN, -0 and the smallest
+                    // subnormals
+                    uint16_t pair;
+                    asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(pair) : "r"(*(const uint32_t*)(cached_q + i)));
+                    *(uint16_t*)(own + i) = pair;
                 }
                 uint4 partner[NUM_CHUNKS];
                 CUTE_UNROLL
