@@ -1052,6 +1052,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 score_multiplier = params.sm_scale_div_log2;
             }
 
+            smem.bar_tQ_empty.wait(cur_job.job_idx_mod_2 ^ 1);
             smem.bar_tQ_empty.arrive(); // Must arrive on the empty barrier here, to prevent smem.bar_tQ_full being phase-skipped
 
             CUTE_NO_UNROLL
