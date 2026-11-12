@@ -160,6 +160,10 @@ def flash_mla_with_kvcache(
                 extra KV cache). If > 0, each q token packs up to 5 real tokens, `heads_per_group` heads each,
                 and bits 26..30 of every index say which of those tokens attend to it; see
                 SparseAttnDecodeParams::heads_per_group. 0 (the default) disables it.
+        kv_format: Optional[str]. Names the layout of `k_cache` when its size is ambiguous. On the current kernels
+                only "V32_NO_ROPE" needs it: 512 fp8 values followed by 4 fp32 scales of 128 dims each (528 Bytes, the
+                same size as V4.1, which is what 528 Bytes means without it). It runs on the head128 kernel, so
+                `num_heads_q` must be 128 (pad q), with no extra cache of another format.
 
     For DeepSeek V4.1:
         head_dim should be 512 while head_dim_v should be 512.
@@ -274,15 +278,11 @@ def flash_mla_with_kvcache(
         )
     else:
         assert heads_per_group == 0, "heads_per_group only applies to the legacy kernels"
-        assert kv_format is None, (
-            "kv_format only applies to the legacy kernels: the current ones accept the V4.1 "
-            "formats only, so there is nothing to disambiguate"
-        )
         out, lse, new_tile_scheduler_metadata, new_num_splits = ops.sparse_decode_fwd(
             q, k_cache, indices_in_kvcache, topk_length, attn_sink,
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
             extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
-            head_dim_v, softmax_scale, enable_batch_invariant
+            head_dim_v, softmax_scale, enable_batch_invariant, kv_format
         )
     sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
     sched_meta.num_splits = new_num_splits

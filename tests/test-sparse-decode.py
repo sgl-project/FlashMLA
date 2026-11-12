@@ -33,6 +33,7 @@ def gen_testcase() -> List[RawTestParam]:
         for kvcache_layout, extra_kvcache_layout in [
             (quant.KVCacheLayout.V41_FP8Sparse, None),
             (quant.KVCacheLayout.V41_FP8Sparse, quant.KVCacheLayout.V41_FP4Sparse),   # fp4 extra_kv_cache
+            (quant.KVCacheLayout.V32_NO_ROPE_FP8Sparse, None),    # Kimi-K3.1, head128 only
         ]:
             if extra_kvcache_layout is not None and not have_extra_k:
                 continue    # The extra layout is meaningless without an extra cache
@@ -326,7 +327,7 @@ def main():
             str(testcase.s_kv),
             str(testcase.d_qk),
             " V"[testcase.decode.is_varlen] + " L"[testcase.have_topk_length] + " E"[testcase.decode.have_extra_topk_length],
-            "FP8+FP4" if testcase.decode.extra_kvcache_layout == quant.KVCacheLayout.V41_FP4Sparse else "FP8",
+            "FP8+FP4" if testcase.decode.extra_kvcache_layout == quant.KVCacheLayout.V41_FP4Sparse else "V32NR" if testcase.decode.kvcache_layout == quant.KVCacheLayout.V32_NO_ROPE_FP8Sparse else "FP8",
             f"{result.compute_memory_ratio:3.0f}",
             f"{result.achieved_tflops:3.0f}",
             f"{result.achieved_gBps:4.0f}",

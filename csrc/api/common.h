@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <cctype>
+#include <optional>
 #include <deque>
 #include <limits>
 #include <mutex>
@@ -197,7 +199,20 @@ static constexpr std::string get_dynamic_enum_name(T value){
 // Paged quantized KV cache formats (decoding)
 // =============================================
 
-// The format of a paged quantized KV cache with d_qk = 512 (V4.1 fp8 / fp4), detected by bytes_per_token (kv.size(3))
+// A KV cache format named by the caller (the `kv_format` argument of sparse_decode_fwd), e.g. "V41" or "v32_no_rope"
+inline ModelType parse_kv_cache_format(const std::string &name) {
+    std::string upper;
+    for (char c : name) upper += (char)std::toupper((unsigned char)c);
+    for (ModelType mt : {ModelType::V41, ModelType::V41_FP4, ModelType::V32_NO_ROPE}) {
+        if (upper == get_dynamic_enum_name(mt)) {
+            return mt;
+        }
+    }
+    STD_TORCH_CHECK(false, "Unknown kv_format: ", name, ". Expected one of V41, V41_FP4, V32_NO_ROPE");
+}
+
+// The format of a paged quantized KV cache with d_qk = 512 (V4.1 fp8 / fp4), detected by bytes_per_token (kv.size(3)).
+// V3.2-no-RoPE is also 528 B per token, so it is never detected: the caller names it with kv_format.
 inline ModelType detect_kv_cache_format_for_headdim_512(int bytes_per_token) {
     for (ModelType mt : {ModelType::V41, ModelType::V41_FP4}) {
         if (bytes_per_token == kv_cache_bytes_per_token(mt)) {

@@ -38,7 +38,8 @@ using stream_t = aclrtStream;
 
 enum class ModelType {
     V41,    // DeepSeek V4.1 (d_qk=512, RoPE fp8, tile_size=32)
-    V41_FP4     // DeepSeek V4.1 (d_qk=512, fp4 e2m1, tile_size=16, e4m3 scales)
+    V41_FP4,    // DeepSeek V4.1 (d_qk=512, fp4 e2m1, tile_size=16, e4m3 scales)
+    V32_NO_ROPE // V3.2 layout without the RoPE part (d_qk=512, fp8, tile_size=128, fp32 scales), e.g. Kimi-K3.1
 };
 
 enum class SparseAttnFwdMode {

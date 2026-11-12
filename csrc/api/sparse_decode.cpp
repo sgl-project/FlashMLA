@@ -93,7 +93,8 @@ class SparseDecode_Sm100_Head128_Impl : public SparseDecodeImplBase {
         SparseDecodeFeatures::BATCH_INVARIANT
     )
     using SupportedKVFormats = KVFormatPairs<KVFormatPair<ModelType::V41>,
-                                             KVFormatPair<ModelType::V41, ModelType::V41_FP4>>;
+                                             KVFormatPair<ModelType::V41, ModelType::V41_FP4>,
+                                             KVFormatPair<ModelType::V32_NO_ROPE>>;
 
 public:
     SparseDecodeImplMeta get_meta(int h_q, int s_q) override {
@@ -182,7 +183,8 @@ sparse_decode_fwd(
     const std::optional<Tensor> &extra_topk_length,
     int64_t d_v,
     double sm_scale,
-    bool enable_batch_invariant
+    bool enable_batch_invariant,
+    const std::optional<std::string> &kv_format
 ) {
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     // Check the architecture
@@ -282,9 +284,11 @@ sparse_decode_fwd(
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
     // The formats of `kv` and `extra_kv`
-    ModelType model_type = detect_kv_cache_format_for_headdim_512(kv.size(3));
-    ModelType extra_model_type = have_extra_kcache ? detect_kv_cache_format_for_headdim_512(extra_kv->size(3)) : model_type;
+    ModelType model_type = kv_format.has_value() ? parse_kv_cache_format(*kv_format) : detect_kv_cache_format_for_headdim_512(kv.size(3));
+    ModelType extra_model_type = !have_extra_kcache ? model_type
+        : model_type == ModelType::V32_NO_ROPE ? ModelType::V32_NO_ROPE : detect_kv_cache_format_for_headdim_512(extra_kv->size(3));
     STD_TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
+    STD_TORCH_CHECK(model_type != ModelType::V32_NO_ROPE || h_q == 128, "kv_format V32_NO_ROPE runs on the head128 kernel only; pad q to 128 heads, got h_q = ", h_q);
     STD_TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
     KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, kv_cache_bytes_per_token(model_type));
     KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, kv_cache_bytes_per_token(extra_model_type));

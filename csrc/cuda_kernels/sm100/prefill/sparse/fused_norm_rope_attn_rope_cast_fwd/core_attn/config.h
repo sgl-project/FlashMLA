@@ -150,6 +150,7 @@ static constexpr bool HAS_FP4_KV = ExtraKVFormat::IS_FP4;   // The extra KV cach
 static constexpr uint32_t D_FP8 = OrigKVFormat::D_FP8;
 static constexpr uint32_t KV_QUANT_TILE_SIZE = OrigKVFormat::QUANT_TILE_SIZE;
 static constexpr uint32_t NUM_SCALES_EACH_TOKEN = OrigKVFormat::NUM_SCALES_EACH_TOKEN;
+static_assert(OrigKVFormat::SCALE_BYTES == 1 && ExtraKVFormat::SCALE_BYTES == 1);    // Scale counts are used as byte counts
 static constexpr uint32_t NUM_SCALES_EACH_TOKEN_PER_CTA = NUM_SCALES_EACH_TOKEN / CLUSTER_SIZE;
 static constexpr uint32_t KV_CACHE_BYTES_PER_TOKEN = OrigKVFormat::BYTES_PER_TOKEN;
 // Decode gathers the raw rows of a KV block into the beginning of the KV slot (one 4-row group per gather4) and dequantizes

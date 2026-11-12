@@ -75,6 +75,8 @@ CUDA_KERNEL_SOURCES = [
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu",
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4.cu",
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4_splitkv.cu",
+    "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v32norope.cu",
+    "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v32norope_splitkv.cu",
 
     # sm100 sparse decode (head 64, with and without split-KV, on the fp8 and the fp4 cache)
     "csrc/cuda_kernels/sm100/decode/sparse/head64/instantiations/v41_h64.cu",
