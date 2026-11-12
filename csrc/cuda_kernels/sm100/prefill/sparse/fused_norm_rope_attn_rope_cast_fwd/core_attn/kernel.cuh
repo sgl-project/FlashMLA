@@ -1185,9 +1185,11 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
 
                 // Row max over the lane groups holding the head's other token slices: the partner warp (w ^ 2, a 64-thread
                 // barrier per pair). max is exact in any order
-                // The global block counter of rs, not kv_block_idx: that restarts per job, and a job with an odd number of blocks
-                // would put its last block and the next job's first block in the same buffer
-                const uint32_t max_buf_idx = QK_SINGLE_RAIL ? rs.get<2>().first : 0u;
+                // QK_SINGLE_RAIL: alternates with P's buffer, i.e. with rs's global block counter (NUM_P_BUFS == 2),
+                // not with kv_block_idx: that restarts per job, and a job with an odd number of blocks would put its
+                // last block and the next job's first block in the same buffer
+                static_assert(!QK_SINGLE_RAIL || NUM_P_BUFS == 2);
+                const uint32_t max_buf_idx = QK_SINGLE_RAIL ? p_buf_idx : 0u;
                 smem.rowwise_max_buf[max_buf_idx][idx_in_warpgroup] = cur_pi_max;
                 NamedBarrier::arrive_and_wait(32 * FOLD_FACTOR, barrier_ids::WG3_WARP02_SYNC + (local_warp_idx & 1));
                 smem.bar_indices_empty[indices_buf_idx].arrive();   // Put it here to give the compiler more room for code reordering
@@ -2029,7 +2031,7 @@ bool Kernel<CONFIG>::can_use_oversized_smem() {
 
 
 template<Config CONFIG>
-void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const KernelParamT<CONFIG>& params) {
+void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>& params) {
     // The fp8 prefill has 4 KV slots without the oversized shared memory, and no staged-Q variant
     if constexpr (CONFIG.FWD_MODE == SparseAttnFwdMode::Prefill && CONFIG.H_Q == 64 && !CONFIG.QKV_FP8) {
         constexpr Config PREFILL_OVERSIZED_CONFIG = [] {

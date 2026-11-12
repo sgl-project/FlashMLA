@@ -98,6 +98,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     KU_CHECK_DTYPE(q, ScalarType::BFloat16);
     STD_TORCH_CHECK(kv.scalar_type() == ScalarType::BFloat16 || kv_is_fp8, "kv must have dtype bfloat16 or float8_e4m3fn");
     STD_TORCH_CHECK(!kv_is_fp8 || h_q == 64, "The fp8 kv (float8_e4m3fn) path supports h_q == 64 only, got ", h_q);
+    STD_TORCH_CHECK(!kv_is_fp8 || !enable_q_norm, "The fp8 kv (float8_e4m3fn) path supports enable_q_norm == false only");
     KU_CHECK_DTYPE(indices, ScalarType::Int);
     KU_CHECK_DTYPE(attn_sink, ScalarType::Float);
     KU_CHECK_DTYPE(topk_length, ScalarType::Int);
@@ -185,13 +186,11 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     };
 
     if (kv_is_fp8) {
-        sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::PrefillFP8Params fp8_params = {params};
-        DISPATCH_BOOLEAN_FLAG(enable_q_norm, ENABLE_Q_NORM, ([&]() {
-            sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{
-                .FWD_MODE = SparseAttnFwdMode::Prefill, .MODEL_TYPE = ModelType::V41, .EXTRA_MODEL_TYPE = ModelType::V41,
-                .H_Q = 64, .ENABLE_Q_NORM = ENABLE_Q_NORM, .QKV_FP8 = true
-            }>(fp8_params);
-        }));
+        // params.kv (declared bf16*) points to the e4m3 data here, and stride_kv_s_kv counts e4m3 elements
+        sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{
+            .FWD_MODE = SparseAttnFwdMode::Prefill, .MODEL_TYPE = ModelType::V41, .EXTRA_MODEL_TYPE = ModelType::V41,
+            .H_Q = 64, .ENABLE_Q_NORM = false, .QKV_FP8 = true
+        }>(params);
         return {out_fp8, out_sf, max_logits, lse};
     }
 

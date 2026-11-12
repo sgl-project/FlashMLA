@@ -94,7 +94,7 @@ static constexpr ModelType MODEL_TYPE = CONFIG.MODEL_TYPE;
 static constexpr ModelType EXTRA_MODEL_TYPE = CONFIG.EXTRA_MODEL_TYPE;
 static constexpr uint32_t H_Q = CONFIG.H_Q;
 
-using Params = KernelParamT<CONFIG>;
+using Params = ParamT<FWD_MODE>;
 
 static_assert(FWD_MODE == SparseAttnFwdMode::Prefill || FWD_MODE == SparseAttnFwdMode::Decode);
 static_assert(H_Q == 64 || H_Q == 128);
@@ -127,7 +127,7 @@ static constexpr bool QKV_FP8 = CONFIG.QKV_FP8;
 // 4 * S <= 256 stays below 448. li sums the scaled values, so O / li is unchanged; the row's max is published as
 // m - P_LOG2_SCALE to the epilogue, which uses it only for lse and the sink term
 static constexpr float P_LOG2_SCALE = QKV_FP8 ? 2.0f : 0.0f;
-static_assert(!QKV_FP8 || (FWD_MODE == SparseAttnFwdMode::Prefill && H_Q == 64 && !OVERSIZED_SMEM));
+static_assert(!QKV_FP8 || (FWD_MODE == SparseAttnFwdMode::Prefill && H_Q == 64 && !OVERSIZED_SMEM && !ENABLE_Q_NORM));
 using KVElem = std::conditional_t<QKV_FP8, fp8_e4m3, bf16>;   // The element of the KV slots and of S (UMMA operands)
 static constexpr uint32_t KV_CHUNK_ELEMS = 128 / sizeof(KVElem);       // Elements per 128 B swizzle-atom row of a KV slot
 static constexpr uint32_t S_CHUNK_ELEMS = 16 / sizeof(KVElem);         // Elements per 16 B core-matrix row of S
@@ -320,7 +320,7 @@ struct SharedMemoryPlan {
     CUTE_ALIGNAS(1024) KVElem kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
     CUTE_ALIGNAS(1024) KVElem s[H_Q_PER_CTA * B_TOPK];
     CUTE_ALIGNAS(128) bf16 q_half_buf[STAGE_Q ? H_Q * D_QK / 2 : 0];
-    CUTE_ALIGNAS(1024) float p_exchange_buf[QK_SINGLE_RAIL ? 1 : 4][32*NUM_P_ELEMS_PER_THREAD];   // QK_SINGLE_RAIL: unused
+    CUTE_ALIGNAS(1024) float p_exchange_buf[QK_SINGLE_RAIL ? 0 : 4][32*NUM_P_ELEMS_PER_THREAD];   // QK_SINGLE_RAIL: unused
     // QK_SINGLE_RAIL: WG0's e4m3 Q halves, [16 B chunk][thread] so that both the stores and the partner's loads are
     // conflict-free (consecutive threads, consecutive 16 B)
     CUTE_ALIGNAS(128) uint8_t q_xchg_buf[QK_SINGLE_RAIL ? 128 * D_QK / NUM_MRGEMM_RAILS : 0];
