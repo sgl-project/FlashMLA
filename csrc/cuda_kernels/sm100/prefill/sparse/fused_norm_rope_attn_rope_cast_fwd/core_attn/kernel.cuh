@@ -635,8 +635,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             CUTE_UNROLL
             for (uint32_t local_tile_idx = 3; local_tile_idx != 0xFFFFFFFF; --local_tile_idx) {
                 // Rail j holds the 64-dim tiles j, j+2, j+4, j+6 (1 CTA) or the CTA's half of the dims in order (2 CTAs).
-                // QKV_FP8: the swizzle width is 128 dims, so rail j holds the tiles 2j, 2j+1, 4+2j, 5+2j (config.h); local
-                // tile 3 is still the RoPE tile of rail 1
+                // QKV_FP8: rail j holds the 128-dim chunks j, j + 2, i.e. the tiles 2j, 2j+1, 4+2j, 5+2j (config.h),
+                // which the Q exchange below stores to TMEM as whole chunks; local tile 3 is still rail 1's RoPE tile
                 uint32_t tile_idx = CLUSTER_SIZE == 1 ? local_tile_idx * 2 + rail : rail * 4 + local_tile_idx;
                 if constexpr (QKV_FP8) {
                     tile_idx = (local_tile_idx / 2) * 4 + (local_tile_idx % 2) + rail * 2;
@@ -767,26 +767,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     ku::tmem_st_32dp32bNx<CHUNK_COLS>(tmem_cols::Q + 3 * CHUNK_COLS, own + 128);
                 }
             } else {
-            smem.bar_tQ_empty.wait(cur_job.job_idx_mod_2^1);
-            ku::tcgen05_after_thread_sync();
-            }
+                smem.bar_tQ_empty.wait(cur_job.job_idx_mod_2^1);
+                ku::tcgen05_after_thread_sync();
 
-            if constexpr (QK_SINGLE_RAIL) {
-                // stored above
-            } else if constexpr (QKV_FP8) {
-                // Cast to e4m3 right before the TMEM store, a pair at a time: bf16x2 -> f32x2 (exact) -> one
-                // cvt.rn.satfinite.e4m3x2.f32. One 32-bit TMEM word holds 4 e4m3 with k increasing inside the word
-                fp8_e4m3 cached_q_fp8[NUM_CACHED_Q_BF16_PER_THREAD];
-                CUTE_UNROLL
-                for (uint32_t i = 0; i < NUM_CACHED_Q_BF16_PER_THREAD; i += 2) {
-                    float2 x = __bfloat1622float2(*(nv_bfloat162*)(cached_q + i));
-                    *(__nv_fp8x2_storage_t*)(cached_q_fp8 + i) =
-                        __nv_cvt_float2_to_fp8x2(x, __NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
-                }
-                static constexpr uint32_t NUM_CACHED_UINT32 = NUM_CACHED_Q_BF16_PER_THREAD / Q_ELEMS_PER_TMEM_WORD;
-                ku::tmem_st_32dp32bNx<NUM_CACHED_UINT32/2>(tmem_cols::Q, cached_q_fp8);
-                ku::tmem_st_32dp32bNx<NUM_CACHED_UINT32/2>(tmem_cols::Q+NUM_CACHED_UINT32/2, cached_q_fp8+NUM_CACHED_UINT32/2*Q_ELEMS_PER_TMEM_WORD);
-            } else {
                 static constexpr uint32_t NUM_CACHED_UINT32 = NUM_CACHED_Q_BF16_PER_THREAD/2;
                 ku::tmem_st_32dp32bNx<NUM_CACHED_UINT32/2>(tmem_cols::Q, cached_q);
                 ku::tmem_st_32dp32bNx<NUM_CACHED_UINT32/2>(tmem_cols::Q+NUM_CACHED_UINT32/2, cached_q+NUM_CACHED_UINT32/2*2);   // Two stores: one store of all NUM_CACHED_UINT32 words does not compile (insufficient registers)
@@ -1162,12 +1145,13 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 float p[NUM_ELEMS_PER_THREAD];
                 if constexpr (QK_SINGLE_RAIL) {
                     // The lane group of this warp holds the complete P of its token slice (config.h): one TMEM load, no
-                    // cross-rail sum. Masking as in retrieve_mask_and_reduce_p, including its all-valid fast path
+                    // cross-rail sum. Masked with the same mask word as in retrieve_mask_and_reduce_p, but the
+                    // per-element selects are skipped when all 32 tokens are valid
                     static_assert(NUM_ELEMS_PER_THREAD == 32 && !NEED_TP_EMPTY_BAR);
                     ku::tmem_ld_32dp32bNx<NUM_ELEMS_PER_THREAD>(tmem_cols::get_p(p_buf_idx), p);
                     const uint32_t mask_word = *(const uint32_t*)((const char*)&smem.is_k_valid[indices_buf_idx] + token_slice * (NUM_ELEMS_PER_THREAD / 8));
                     cutlass::arch::fence_view_async_tmem_load();
-                    // __all_sync: every lane reaches here and mask_word is warp-uniform (see retrieve_mask_and_reduce_p)
+                    // __all_sync: every lane reaches here, and mask_word is warp-uniform (all lanes read the same word)
                     if (!__all_sync(0xffffffffu, mask_word == 0xffffffffu)) {
                         CUTE_UNROLL
                         for (int i = 0; i < (int)NUM_ELEMS_PER_THREAD; ++i) {

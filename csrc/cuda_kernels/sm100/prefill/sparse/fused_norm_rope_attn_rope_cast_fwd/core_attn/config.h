@@ -118,8 +118,8 @@ static constexpr uint32_t OVERSIZED_SMEM_CAPACITY = 334848;
 // the 1-byte element:
 // - a KV slot is B_TOPK * D_QK B = 32 KB, so 4 slots fit 227 KB without the oversized shared memory (and its staged Q)
 // - the 128 B swizzle atom row holds KV_CHUNK_ELEMS = 128 elements (bf16: 64): 4 TMA gathers per 4-row group instead of
-//   8. The swizzle width is the d granularity at which the multi-rail QK GEMM alternates between its rails, so rail j
-//   holds the 128-dim chunks j, j + 2, and WG0 fills Q's rail j with the same dims
+//   8. WG0 splits Q between its two rails in the same 128-dim chunks (rail j: chunks j, j + 2), so that the exchange
+//   of the single-rail QK (below) stores whole chunks to TMEM
 // - one 32-bit TMEM word of the A operand holds 4 Q elements, a 16 B core-matrix row of S 16 tokens
 static constexpr bool QKV_FP8 = CONFIG.QKV_FP8;
 // QKV_FP8: S is computed as exp2(p * c - m + P_LOG2_SCALE), i.e. scaled by 4 before its e4m3 cast, so that fewer of its
@@ -245,11 +245,8 @@ static_assert(FOLD_FACTOR % NUM_MRGEMM_RAILS == 0);
 // [g * B_TOPK / 2, +B_TOPK / 2). The softmax warpgroup then reads its 32 tokens straight from TMEM, without the cross-rail
 // P sum (16 KB of STS + 16 KB of LDS + a named barrier per block on the softmax's critical path). The cost is on the
 // tensor pipe (16 N = 64 instructions instead of 8 N = 128) and in TMEM (Q 128 columns instead of 64)
-#ifndef FMLA_FP8_SINGLE_RAIL_QK
-#define FMLA_FP8_SINGLE_RAIL_QK 1
-#endif
-static constexpr bool QK_SINGLE_RAIL = QKV_FP8 && (FMLA_FP8_SINGLE_RAIL_QK != 0);
-static constexpr uint32_t QK_RAILS = QK_SINGLE_RAIL ? 1 : NUM_MRGEMM_RAILS;   // rails of the QK GEMM
+static constexpr bool QK_SINGLE_RAIL = QKV_FP8;   // the fp8 prefill always runs the QK GEMM single-rail
+static constexpr uint32_t QK_RAILS = QKV_FP8 ? 1 : NUM_MRGEMM_RAILS;   // rails of the QK GEMM
 static constexpr uint32_t NUM_P_ELEMS_PER_THREAD = H_Q_PER_CTA * B_TOPK / 128;
 // O epilogue tiles per job: (D_VO / FOLD_FACTOR) columns of O per thread in tiles of O_QUANT_TILE_SIZE
 static constexpr uint32_t NUM_EPILOGUE_TILES = D_VO / FOLD_FACTOR / O_QUANT_TILE_SIZE;
@@ -276,7 +273,7 @@ static constexpr uint32_t NEED_TP_EMPTY_BAR = NUM_P_BUFS == 1;  // Don't need to
 
 struct tmem_cols {
     // O: D_VO / FOLD_FACTOR = 256 columns; Q: the K-view of one rail per lane group, D_QK / NUM_MRGEMM_RAILS bf16 = 128 columns
-    // (e4m3: 64);
+    // (QKV_FP8, single-rail QK: the whole D_QK e4m3 = 128 columns, and P is B_TOPK / FOLD_FACTOR = 32 columns each);
     // P: B_TOPK x NUM_MRGEMM_RAILS fp32 per lane group = 64 columns each
     static constexpr uint32_t O = 0;
     static constexpr uint32_t Q = O + D_VO / FOLD_FACTOR;
