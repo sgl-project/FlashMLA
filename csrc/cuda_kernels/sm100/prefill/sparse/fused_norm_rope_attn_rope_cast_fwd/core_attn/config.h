@@ -113,6 +113,26 @@ static constexpr bool OVERSIZED_SMEM = CONFIG.OVERSIZED_SMEM;
 static_assert(!OVERSIZED_SMEM || H_Q == 64);
 static constexpr uint32_t OVERSIZED_SMEM_CAPACITY = 334848;
 
+// fp8 prefill (QKV_FP8, h_q = 64): `kv` is a flat e4m3 tensor gathered into the KV slots as is, Q is cast to e4m3 after
+// RoPE, S is cast to e4m3, and both GEMMs are tcgen05.mma.ws kind::f8f6f4 (K = 32 per instruction). What follows from
+// the 1-byte element:
+// - a KV slot is B_TOPK * D_QK B = 32 KB, so 4 slots fit 227 KB without the oversized shared memory (and its staged Q)
+// - the 128 B swizzle atom row holds KV_CHUNK_ELEMS = 128 elements (bf16: 64): 4 TMA gathers per 4-row group instead of
+//   8. WG0 splits Q between its two rails in the same 128-dim chunks (rail j: chunks j, j + 2), so that the exchange
+//   of the single-rail QK (below) stores whole chunks to TMEM
+// - one 32-bit TMEM word of the A operand holds 4 Q elements, a 16 B core-matrix row of S 16 tokens
+static constexpr bool QKV_FP8 = CONFIG.QKV_FP8;
+// QKV_FP8: S is computed as exp2(p * c - m + P_LOG2_SCALE), i.e. scaled by 4 before its e4m3 cast, so that fewer of its
+// small values fall into e4m3's subnormals or to zero. S <= 2^6 relative to the running max (the rescale threshold), so
+// 4 * S <= 256 stays below 448. li sums the scaled values, so O / li is unchanged; the row's max is published as
+// m - P_LOG2_SCALE to the epilogue, which uses it only for lse and the sink term
+static constexpr float P_LOG2_SCALE = QKV_FP8 ? 2.0f : 0.0f;
+static_assert(!QKV_FP8 || (FWD_MODE == SparseAttnFwdMode::Prefill && H_Q == 64 && !OVERSIZED_SMEM && !ENABLE_Q_NORM));
+using KVElem = std::conditional_t<QKV_FP8, fp8_e4m3, bf16>;   // The element of the KV slots and of S (UMMA operands)
+static constexpr uint32_t KV_CHUNK_ELEMS = 128 / sizeof(KVElem);       // Elements per 128 B swizzle-atom row of a KV slot
+static constexpr uint32_t S_CHUNK_ELEMS = 16 / sizeof(KVElem);         // Elements per 16 B core-matrix row of S
+static constexpr uint32_t Q_ELEMS_PER_TMEM_WORD = 4 / sizeof(KVElem);  // Q elements per 32-bit TMEM word
+
 // Cluster shape selection
 static constexpr uint32_t CLUSTER_SIZE = ku::ceil_div((uint32_t)H_Q, 64u);
 static constexpr uint32_t IS_2CTA = CLUSTER_SIZE == 2;
@@ -194,7 +214,10 @@ static_assert(24 <= WG1_REGS && 24 <= WG2_REGS && WG0_REGS <= 256 && WG3_REGS <=
 // the previous tile (load_q_and_save_to_tmem). 1-CTA kernels only: on the 2-CTA kernels the burst overlaps no
 // shared-memory instruction of the critical path, so the grouping has nothing to hide and its serial load latencies
 // only add to the job
-static constexpr bool GROUP_Q_LOADS = CLUSTER_SIZE == 1;
+// QKV_FP8: not grouped. An fp8 job is about half as long (half the KV bytes), so the ~3 serial load latencies land on
+// the critical path between jobs: on B200 the grouped loads cost the fp8 prefill 14-19% on short jobs (2 KV blocks per
+// row, 20480 / 0 of an SWA-only layer) and are neutral on long ones
+static constexpr bool GROUP_Q_LOADS = CLUSTER_SIZE == 1 && !QKV_FP8;
 
 static constexpr uint32_t NUM_THREADS = 512;
 // Every thread that calls get_next_job arrives on bar_clc_empty once per CLC round, and this count
@@ -218,6 +241,13 @@ static constexpr uint32_t NUM_WORKING_THREADS =
 static constexpr uint32_t FOLD_FACTOR = 128 / H_Q_PER_CTA;
 static constexpr uint32_t NUM_MRGEMM_RAILS = 2; // The number of "rails" (batch size) during multi-rail GeMM. Currently must be 2
 static_assert(FOLD_FACTOR % NUM_MRGEMM_RAILS == 0);
+// QKV_FP8: single-rail QK. Both lane groups hold the WHOLE 512-dim Q (WG0 exchanges its two rail halves through
+// q_xchg_buf), and the QK GEMM is N = B_TOPK, K = D_QK: lane group g gets the N-slice g, i.e. the complete P of tokens
+// [g * B_TOPK / 2, +B_TOPK / 2). The softmax warpgroup then reads its 32 tokens straight from TMEM, without the cross-rail
+// P sum (16 KB of STS + 16 KB of LDS + a named barrier per block on the softmax's critical path). The cost is on the
+// tensor pipe (16 N = 64 instructions instead of 8 N = 128) and in TMEM (Q 128 columns instead of 64)
+static constexpr bool QK_SINGLE_RAIL = QKV_FP8;   // the fp8 prefill always runs the QK GEMM single-rail
+static constexpr uint32_t QK_RAILS = QKV_FP8 ? 1 : NUM_MRGEMM_RAILS;   // rails of the QK GEMM
 static constexpr uint32_t NUM_P_ELEMS_PER_THREAD = H_Q_PER_CTA * B_TOPK / 128;
 // O epilogue tiles per job: (D_VO / FOLD_FACTOR) columns of O per thread in tiles of O_QUANT_TILE_SIZE
 static constexpr uint32_t NUM_EPILOGUE_TILES = D_VO / FOLD_FACTOR / O_QUANT_TILE_SIZE;
@@ -226,9 +256,12 @@ static constexpr uint32_t NUM_EPILOGUE_TILES = D_VO / FOLD_FACTOR / O_QUANT_TILE
 // load, conversion and stores per iteration. The 2-CTA prefill kernels use 0. Their first SV of a job waits on the softmax's
 // first S, and S is published later than tO_empty, so an earlier tO_empty does not start the SV earlier, while the stores the
 // pipeline concentrates into a shorter time delay that softmax block
-static constexpr uint32_t EPILOGUE_TILES_AHEAD = WIDE_WG0 ? std::min(6u, NUM_EPILOGUE_TILES) : 0;
+// QKV_FP8: 0 (the per-tile loop) is faster on B200: +2-3% on long rows, +3% on 20480 / 0 of an SWA-only layer.
+// Upstream's PIPELINED_EPILOGUE no longer goes through this constant (it is its own `else if constexpr` branch in
+// the epilogue), and it is decode-only, so only the WIDE_WG0 form plus the QKV_FP8 opt-out is left here.
+static constexpr uint32_t EPILOGUE_TILES_AHEAD = (WIDE_WG0 && !QKV_FP8) ? std::min(6u, NUM_EPILOGUE_TILES) : 0;
 
-static constexpr uint32_t NUM_KV_SLOTS = OVERSIZED_SMEM ? 4 : 3;
+static constexpr uint32_t NUM_KV_SLOTS = (OVERSIZED_SMEM || QKV_FP8) ? 4 : 3;
 static constexpr bool STAGE_Q = OVERSIZED_SMEM && CONFIG.STAGE_Q;
 static constexpr uint32_t NUM_INDICES_BUFS = 4;
 // Raw-gather barriers: an alternating pair, so two gather batches can be issued but not completed at the same
@@ -240,12 +273,13 @@ static constexpr uint32_t NUM_P_BUFS = CLUSTER_SIZE == 2 ? 1 : 2;
 static constexpr uint32_t NEED_TP_EMPTY_BAR = NUM_P_BUFS == 1;  // Don't need to wait for P's emptiness as long as P has >= 2 buffers, since "we are issuing P[i]" <-- "O[i-2] has been issued" <-- "S[i-2] is ready" <-- "P[i-2] is free"
 
 struct tmem_cols {
-    // O: D_VO / FOLD_FACTOR = 256 columns; Q: the K-view of one rail per lane group, D_QK / NUM_MRGEMM_RAILS bf16 = 128 columns;
+    // O: D_VO / FOLD_FACTOR = 256 columns; Q: the K-view of one rail per lane group, D_QK / NUM_MRGEMM_RAILS bf16 = 128 columns
+    // (QKV_FP8, single-rail QK: the whole D_QK e4m3 = 128 columns, and P is B_TOPK / FOLD_FACTOR = 32 columns each);
     // P: B_TOPK x NUM_MRGEMM_RAILS fp32 per lane group = 64 columns each
     static constexpr uint32_t O = 0;
     static constexpr uint32_t Q = O + D_VO / FOLD_FACTOR;
-    static constexpr uint32_t P_0 = Q + D_QK / NUM_MRGEMM_RAILS / 2;  // /2 since 2 bf16 is packed in 1 uint32
-    static constexpr uint32_t P_1 = P_0 + B_TOPK*NUM_MRGEMM_RAILS/FOLD_FACTOR;
+    static constexpr uint32_t P_0 = Q + D_QK / QK_RAILS / Q_ELEMS_PER_TMEM_WORD;
+    static constexpr uint32_t P_1 = P_0 + B_TOPK*QK_RAILS/FOLD_FACTOR;
 
     static constexpr uint32_t get_p(const uint32_t &p_buf_idx) {
         if constexpr (NUM_P_BUFS == 1) {
@@ -256,13 +290,17 @@ struct tmem_cols {
             static_assert(NUM_P_BUFS == 1 || NUM_P_BUFS == 2);
         }
     }
-    static_assert(get_p(NUM_P_BUFS-1) + B_TOPK*NUM_MRGEMM_RAILS/FOLD_FACTOR <= 512);
+    static_assert(get_p(NUM_P_BUFS-1) + B_TOPK*QK_RAILS/FOLD_FACTOR <= 512);
 };
 
 using MMAAtom_QK = cute::conditional_t<
     CLUSTER_SIZE == 2,
     SM100_MMA_F16BF16_2x1SM_TS_NOELECT<bf16, bf16, float, MMA_M, B_TOPK * NUM_MRGEMM_RAILS, UMMA::Major::K, UMMA::Major::K>,
-    SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, MMA_M, B_TOPK * NUM_MRGEMM_RAILS, UMMA::Major::K, UMMA::Major::K>
+    cute::conditional_t<
+        QKV_FP8,
+        SM100_MMA_F8F6F4_WS_TS_NOELECT<fp8_e4m3, fp8_e4m3, float, MMA_M, B_TOPK * QK_RAILS, UMMA::Major::K, UMMA::Major::K>,
+        SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, MMA_M, B_TOPK * NUM_MRGEMM_RAILS, UMMA::Major::K, UMMA::Major::K>
+    >
 >;
 using TiledMMA_QK = decltype(make_tiled_mma(MMAAtom_QK{}));
 using TiledMMA_SV = cute::conditional_t<
@@ -272,20 +310,31 @@ using TiledMMA_SV = cute::conditional_t<
         Layout<Shape<_1, _1, _1>>{},
         Tile<Int<128>, Layout<Shape<_128, _2, _2>, Stride<_1, _256, _128>>, _16>{}  // We use this permutation layout to let CTA0 takes V[:, 0:256] and CTA1 takes V[:, 256:512]
     )),
-    decltype(make_tiled_mma(SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, MMA_M, 256, UMMA::Major::K, UMMA::Major::MN>{}))
+    cute::conditional_t<
+        QKV_FP8,
+        decltype(make_tiled_mma(SM100_MMA_F8F6F4_WS_SS_NOELECT<fp8_e4m3, fp8_e4m3, float, MMA_M, 256, UMMA::Major::K, UMMA::Major::MN>{})),
+        decltype(make_tiled_mma(SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, MMA_M, 256, UMMA::Major::K, UMMA::Major::MN>{}))
+    >
 >;
 
 struct SharedMemoryPlan {
-    CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
-    CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
+    CUTE_ALIGNAS(1024) KVElem kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
+    CUTE_ALIGNAS(1024) KVElem s[H_Q_PER_CTA * B_TOPK];
     CUTE_ALIGNAS(128) bf16 q_half_buf[STAGE_Q ? H_Q * D_QK / 2 : 0];
-    CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
+    CUTE_ALIGNAS(1024) float p_exchange_buf[QK_SINGLE_RAIL ? 0 : 4][32*NUM_P_ELEMS_PER_THREAD];   // QK_SINGLE_RAIL: unused
+    // QK_SINGLE_RAIL: WG0's e4m3 Q halves, [16 B chunk][thread] so that both the stores and the partner's loads are
+    // conflict-free (consecutive threads, consecutive 16 B)
+    CUTE_ALIGNAS(128) uint8_t q_xchg_buf[QK_SINGLE_RAIL ? 128 * D_QK / NUM_MRGEMM_RAILS : 0];
     CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
     // Decode: WG10 produces metadata once for the four dequant warps. 16 B aligned so that the fp4 path can read
     // the coordinates of 4 consecutive rows with one LDS.128
     CUTE_ALIGNAS(16) int decode_tma_coords[IS_DECODE ? NUM_INDICES_BUFS : 0][B_TOPK];
     float q_sqr_sum_buf[ENABLE_Q_NORM ? 2 : 0][128];    // We have 2 q_sqr_sum_buf to save some barriers, as Q[i+2] starts to fetch -> O[i] have finished -> Q[i]'s q_sqr_sum_buf is useless
-    float rowwise_max_buf[128];
+    // QK_SINGLE_RAIL: two buffers, alternating with the softmax's global block counter. Without the cross-rail exchange no
+    // barrier orders the partner warp's read of block k before this warp's write of block k + 1; with two buffers the write
+    // of block k + 2 comes after block k + 1's pair barrier, which the partner reaches only after its read of block k
+    // (found with compute-sanitizer racecheck)
+    float rowwise_max_buf[QK_SINGLE_RAIL ? 2 : 1][128];
     float rowwise_mi_buf[H_Q_PER_CTA];
     float rowwise_li_buf[128];    // 128: warpgroup size
 

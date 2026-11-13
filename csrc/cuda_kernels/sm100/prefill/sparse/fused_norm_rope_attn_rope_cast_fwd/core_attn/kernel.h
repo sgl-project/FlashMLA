@@ -19,6 +19,7 @@ struct Config {
     bool STAGE_Q = true;
     bool PIPELINED_EPILOGUE = false;   // Decode h64, at most one wave: one tile of TMEM-load lookahead in the O epilogue
     bool JOB_PREFETCH = false;         // Decode, above one wave: prefetch the next job's block 0 indices
+    bool QKV_FP8 = false;              // Prefill h64: `kv` is e4m3, and Q, K, V and P enter the UMMAs as e4m3
 };
 
 // Parameters for the fused Q-b-norm + Q RoPE + Core Attention Forward (prefill/decoding) + O RoPE + O Cast kernel

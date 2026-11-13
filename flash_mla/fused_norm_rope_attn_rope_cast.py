@@ -58,7 +58,15 @@ def prefill(
 
     Args (Core Attn):
         q: [s_q, h_q, d_qk], bfloat16
-        kv: [s_kv, h_kv, d_qk], bfloat16
+        kv: [s_kv, h_kv, d_qk], bfloat16, or float8_e4m3fn for the fp8 sparse prefill (h_q == 64, enable_q_norm=False
+            and use_legacy=False only), in which Q, K, V and P all enter the tensor cores as e4m3. Contract of the fp8
+            kv: it is read with unit scale, so the caller must keep |kv| <= 448 (larger values saturate; values below
+            2^-6 are e4m3 subnormals); the recommended source is the bf16 workspace values rounded to e4m3 directly,
+            best written as e4m3 by the KV cache dequant itself (the same bits as casting the bf16 workspace, without
+            the extra pass). Q is cast to e4m3 in the kernel after RoPE, also with unit scale, so |q| <= 448 is
+            required as well. P is scaled by 4 in the kernel before its e4m3 cast (P <= 2^6 relative to the running
+            max, so 4 P <= 256), which keeps more of its small values out of e4m3's subnormals; out, lse and
+            max_logits are not affected by the factor
         indices: [s_q, h_kv, topk], int32. Invalid indices should be set to < 0, or >= s_kv
         sm_scale: float, scaling factor for attention scores
         d_v: value dimension, must be 512

@@ -56,6 +56,8 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     Arch arch = Arch();
     bool is_sm100f = arch.is_sm100f();
     STD_TORCH_CHECK(is_sm100f, "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_fwd) is only supported on SM100f architectures.");
+    // A float8_e4m3fn kv selects the fp8 sparse prefill (h_q == 64 only), read with unit scale
+    const bool kv_is_fp8 = kv.scalar_type() == ScalarType::Float8_e4m3fn;
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -94,7 +96,9 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     KU_CHECK_DEVICE(cos_sin_cache);
     
     KU_CHECK_DTYPE(q, ScalarType::BFloat16);
-    KU_CHECK_DTYPE(kv, ScalarType::BFloat16);
+    STD_TORCH_CHECK(kv.scalar_type() == ScalarType::BFloat16 || kv_is_fp8, "kv must have dtype bfloat16 or float8_e4m3fn");
+    STD_TORCH_CHECK(!kv_is_fp8 || h_q == 64, "The fp8 kv (float8_e4m3fn) path supports h_q == 64 only, got ", h_q);
+    STD_TORCH_CHECK(!kv_is_fp8 || !enable_q_norm, "The fp8 kv (float8_e4m3fn) path supports enable_q_norm == false only");
     KU_CHECK_DTYPE(indices, ScalarType::Int);
     KU_CHECK_DTYPE(attn_sink, ScalarType::Float);
     KU_CHECK_DTYPE(topk_length, ScalarType::Int);
@@ -180,6 +184,15 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
         out_sf_swizzled_128x4 ? 128u : (uint32_t)int64_stride_to_int(out_sf.stride(2)),
         out_sf_swizzled_128x4
     };
+
+    if (kv_is_fp8) {
+        // params.kv (declared bf16*) points to the e4m3 data here, and stride_kv_s_kv counts e4m3 elements
+        sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{
+            .FWD_MODE = SparseAttnFwdMode::Prefill, .MODEL_TYPE = ModelType::V41, .EXTRA_MODEL_TYPE = ModelType::V41,
+            .H_Q = 64, .ENABLE_Q_NORM = false, .QKV_FP8 = true
+        }>(params);
+        return {out_fp8, out_sf, max_logits, lse};
+    }
 
     DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
         DISPATCH_BOOLEAN_FLAG(enable_q_norm, ENABLE_Q_NORM, ([&]() {
