@@ -30,7 +30,6 @@ struct KVCachePart : F {
     static_assert((NUM_CTAS == 1 || NUM_CTAS == 2) && 0 <= CTA && CTA < NUM_CTAS);
     static constexpr int QUANT_DIMS = F::D_QK / NUM_CTAS;
     static constexpr int QUANT_BYTES = F::QUANT_BYTES / NUM_CTAS;
-    static constexpr int NUM_SCALES = F::NUM_SCALES_EACH_TOKEN / NUM_CTAS;
     static constexpr int SCALE_BYTES_PART = F::SCALE_BYTES_EACH_TOKEN / NUM_CTAS;
     static constexpr int RAW_TOKEN_OFFSET = CTA * QUANT_BYTES;
     static constexpr int SCALE_TOKEN_OFFSET = F::QUANT_BYTES + CTA * SCALE_BYTES_PART;

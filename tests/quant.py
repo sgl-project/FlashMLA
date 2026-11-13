@@ -203,7 +203,7 @@ def dequantize_k_cache(
         # Each fp32 scale is rounded to bf16 and multiplied in bf16, as in the kernel
         quant_k_cache = quant_k_cache.view(num_blocks, block_size, -1)
         data = quant_k_cache[..., :d].to(torch.bfloat16).view(num_blocks, block_size, num_tiles, tile_size)
-        scales = quant_k_cache[..., d:].contiguous().view(torch.float32).to(torch.bfloat16)   # [num_blocks, block_size, 4]
+        scales = quant_k_cache[..., d:].view(torch.float32).to(torch.bfloat16)   # [num_blocks, block_size, 4]
         result[:] = (data * scales.unsqueeze(-1)).view(num_blocks, block_size, d)
 
     else:

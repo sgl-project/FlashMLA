@@ -43,7 +43,6 @@ static constexpr int D_V = 512;
 static constexpr int D_FP8 = OrigKVFormat::D_FP8;     // K dimensions stored as fp8 and needing dequant
 static constexpr int QUANT_TILE_SIZE = OrigKVFormat::QUANT_TILE_SIZE;
 static constexpr int NUM_SCALES_EACH_TOKEN = OrigKVFormat::NUM_SCALES_EACH_TOKEN;    // Padding is included
-static_assert(OrigKVFormat::SCALE_BYTES == 1 && ExtraKVFormat::SCALE_BYTES == 1);    // Scale counts are used as byte counts below
 static constexpr int TMA_K_STRIDE = OrigKVFormat::BYTES_PER_TOKEN;   // Interleaved raw data and scales form one TMA row
 
 static constexpr int B_TOPK = 64;

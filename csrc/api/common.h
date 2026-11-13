@@ -203,17 +203,23 @@ static constexpr std::string get_dynamic_enum_name(T value){
 inline ModelType parse_kv_cache_format(const std::string &name) {
     std::string upper;
     for (char c : name) upper += (char)std::toupper((unsigned char)c);
-    for (ModelType mt : {ModelType::V41, ModelType::V41_FP4, ModelType::V32_NO_ROPE}) {
-        if (upper == get_dynamic_enum_name(mt)) {
-            return mt;
+    std::string names;
+    for (std::size_t i = 0; i < get_enum_max<ModelType>(); ++i) {
+        const std::string cur = get_dynamic_enum_name(static_cast<ModelType>(i));
+        if (upper == cur) {
+            return static_cast<ModelType>(i);
         }
+        names += (i ? ", " : "") + cur;
     }
-    STD_TORCH_CHECK(false, "Unknown kv_format: ", name, ". Expected one of V41, V41_FP4, V32_NO_ROPE");
+    STD_TORCH_CHECK(false, "Unknown kv_format: ", name, ". Expected one of ", names);
 }
 
-// The format of a paged quantized KV cache with d_qk = 512 (V4.1 fp8 / fp4), detected by bytes_per_token (kv.size(3)).
-// V3.2-no-RoPE is also 528 B per token, so it is never detected: the caller names it with kv_format.
-inline ModelType detect_kv_cache_format_for_headdim_512(int bytes_per_token) {
+// The format of a paged quantized KV cache with d_qk = 512, detected by bytes_per_token (kv.size(3)). V4.1 and
+// V3.2-no-RoPE are both 528 B per token: `preferred` wins when its size matches, otherwise 528 B is V4.1.
+inline ModelType detect_kv_cache_format_for_headdim_512(int bytes_per_token, std::optional<ModelType> preferred = std::nullopt) {
+    if (preferred.has_value() && bytes_per_token == kv_cache_bytes_per_token(*preferred)) {
+        return *preferred;
+    }
     for (ModelType mt : {ModelType::V41, ModelType::V41_FP4}) {
         if (bytes_per_token == kv_cache_bytes_per_token(mt)) {
             return mt;
