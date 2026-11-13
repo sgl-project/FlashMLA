@@ -37,7 +37,7 @@ struct KVBlockDequantizer {
     static constexpr int RAW_BYTES_PER_STEP = F::IS_FP4 ? ELEMS_PER_STEP / 2 : ELEMS_PER_STEP;
     static constexpr int RAW_BYTES_PER_THREAD_STEP = RAW_BYTES_PER_STEP / GROUP_SIZE;
     static constexpr int NUM_SCALES = D / F::QUANT_TILE_SIZE;                   // 16 for the 512 fp8 dims of V4.1, 32 for its 512 fp4 dims
-    static constexpr int SCALE_LOAD_BYTES = (NUM_SCALES + 3) / 4 * 4;           // Whole words (the scale rows are padded, see KVCacheFormat)
+    static constexpr int SCALE_LOAD_BYTES = (NUM_SCALES * F::SCALE_BYTES + 3) / 4 * 4;   // Whole words (the scale rows are padded, see KVCacheFormat)
     using RawWord = std::conditional_t<F::IS_FP4, uint32_t, uint64_t>;
     static_assert(D % ELEMS_PER_STEP == 0 && B_TOPK % NUM_GROUPS == 0 && SCALE_LOAD_BYTES <= SCALE_SMEM_STRIDE);
     static_assert(RAW_TOKEN_SMEM_STRIDE >= NUM_STEPS * RAW_BYTES_PER_STEP);   // RAW_TOKEN_SMEM_STRIDE must hold a row's data
@@ -96,9 +96,17 @@ struct KVBlockDequantizer {
                         data_bf16[i] = __hmul2(data_bf16[i], scale);   // Exact: e2m1 x e4m3 has at most 2 + 4 significant bits
                 } else {
                     const int scale_idx = scale_idx_base + (F::QUANT_TILE_SIZE == 32 ? idx_in_group >= GROUP_SIZE / 2 : 0);
-                    CUTE_UNROLL
-                    for (int i = 0; i < 4; ++i) {
-                        data_bf16[i] = fp8x2_to_bf16x2_with_scale(((ku::nve4m3x2*)&data)[i], ((__nv_fp8_e8m0*)scales_row)[scale_idx]);
+                    if constexpr (F::IS_V32_NO_ROPE) {
+                        const ku::nvbf16x2 scale = __float2bfloat162_rn(((const float*)scales_row)[scale_idx]);
+                        CUTE_UNROLL
+                        for (int i = 0; i < 4; ++i) {
+                            data_bf16[i] = __hmul2(fp8x2_to_bf16x2(((ku::nve4m3x2*)&data)[i]), scale);
+                        }
+                    } else {
+                        CUTE_UNROLL
+                        for (int i = 0; i < 4; ++i) {
+                            data_bf16[i] = fp8x2_to_bf16x2_with_scale(((ku::nve4m3x2*)&data)[i], ((__nv_fp8_e8m0*)scales_row)[scale_idx]);
+                        }
                     }
                 }
                 if (local_row_idx == 0 && local_col_idx == 0) {

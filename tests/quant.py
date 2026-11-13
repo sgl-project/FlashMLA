@@ -8,12 +8,14 @@ import kernelkit as kk
 class KVCacheLayout(enum.Enum):
     V41_FP8Sparse = 0
     V41_FP4Sparse = 1
+    V32_NO_ROPE_FP8Sparse = 2
 
     def get_meta(self) -> Tuple[int, int, int, int, int]:
         # Return: (d, d_nope, d_rope, tile_size, num_tiles)
         return {
             KVCacheLayout.V41_FP8Sparse: (512, 448, 64, 32, 16),  # 14 NoPE + 2 RoPE tiles
             KVCacheLayout.V41_FP4Sparse: (512, 448, 64, 16, 32),  # 28 NoPE + 4 RoPE tiles, all fp4
+            KVCacheLayout.V32_NO_ROPE_FP8Sparse: (512, 512, 0, 128, 4),  # V3.2 without the RoPE part
         }[self]
 
     def get_bytes_per_token(self) -> int:
@@ -21,6 +23,7 @@ class KVCacheLayout(enum.Enum):
         return {
             KVCacheLayout.V41_FP8Sparse: d_nope + d_rope + num_tiles,
             KVCacheLayout.V41_FP4Sparse: d // 2 + num_tiles,
+            KVCacheLayout.V32_NO_ROPE_FP8Sparse: d_nope + num_tiles * 4,
         }[self]
 
 def _cast_scale_inv_to_ue8m0(scales_inv: torch.Tensor, out_dtype = torch.float32) -> torch.Tensor:
@@ -132,6 +135,15 @@ def quantize_k_cache(
         result = result.view(num_blocks, block_size, 1, -1)
         return result
 
+    elif kvcache_layout == KVCacheLayout.V32_NO_ROPE_FP8Sparse:
+        # Token layout: [512 B fp8 data, 4 fp32 scales of amax / 448]
+        result = torch.empty((num_blocks, block_size, kvcache_layout.get_bytes_per_token()), dtype=torch.float8_e4m3fn, device=input_k_cache.device)
+        x = input_k_cache.float().view(num_blocks, block_size, num_tiles, tile_size)
+        scale = torch.clamp_min(x.abs().amax(dim=-1) / 448.0, 1e-4)
+        result[..., :d] = (x / scale.unsqueeze(-1)).view(num_blocks, block_size, d).to(torch.float8_e4m3fn)
+        result[..., d:].view(torch.float32)[:] = scale
+        return result.view(num_blocks, block_size, 1, -1)
+
     else:
         raise NotImplementedError(f"Unsupported kvcache_layout: {kvcache_layout}")
     
@@ -186,6 +198,13 @@ def dequantize_k_cache(
                 values = _dequantize_e2m1(codes).view(b1 - b0, block_size, num_tiles, tile_size)
             # e2m1 x e4m3 has at most 2 + 4 significant bits, so the product is exact in bf16, as in the kernel
             result[b0:b1] = (values * input_scale[b0:b1].to(values.dtype).unsqueeze(-1)).view(b1 - b0, block_size, d).to(torch.bfloat16)
+
+    elif kvcache_layout == KVCacheLayout.V32_NO_ROPE_FP8Sparse:
+        # Each fp32 scale is rounded to bf16 and multiplied in bf16, as in the kernel
+        quant_k_cache = quant_k_cache.view(num_blocks, block_size, -1)
+        data = quant_k_cache[..., :d].to(torch.bfloat16).view(num_blocks, block_size, num_tiles, tile_size)
+        scales = quant_k_cache[..., d:].view(torch.float32).to(torch.bfloat16)   # [num_blocks, block_size, 4]
+        result[:] = (data * scales.unsqueeze(-1)).view(num_blocks, block_size, d)
 
     else:
         raise NotImplementedError(f"Unsupported kvcache_layout: {kvcache_layout}")

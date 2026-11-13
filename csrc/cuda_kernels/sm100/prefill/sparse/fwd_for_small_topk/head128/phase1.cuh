@@ -723,7 +723,7 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                                 const uint8_t *scales = (const uint8_t*)(is_extra_block ? params.extra_kv : params.kv) + KVPart<F, 0>::SCALE_TOKEN_OFFSET;
                                 CUTE_UNROLL
                                 for (int row = lane_idx; row < B_TOPK; row += 32) {
-                                    copy_kv_scales_async<KVPart<F, 0>::NUM_SCALES>(
+                                    copy_kv_scales_async<KVPart<F, 0>::SCALE_BYTES_PART>(
                                         raw + SCALE_STAGE_OFFSET + row*SCALE_STAGE_ROW_BYTES,
                                         scales, smem.tma_coord[index_buf_idx][row], F::BYTES_PER_TOKEN);
                                 }

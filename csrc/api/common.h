@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <cctype>
+#include <optional>
 #include <deque>
 #include <limits>
 #include <mutex>
@@ -197,8 +199,27 @@ static constexpr std::string get_dynamic_enum_name(T value){
 // Paged quantized KV cache formats (decoding)
 // =============================================
 
-// The format of a paged quantized KV cache with d_qk = 512 (V4.1 fp8 / fp4), detected by bytes_per_token (kv.size(3))
-inline ModelType detect_kv_cache_format_for_headdim_512(int bytes_per_token) {
+// A KV cache format named by the caller (the `kv_format` argument of sparse_decode_fwd), e.g. "V41" or "v32_no_rope"
+inline ModelType parse_kv_cache_format(const std::string &name) {
+    std::string upper;
+    for (char c : name) upper += (char)std::toupper((unsigned char)c);
+    std::string names;
+    for (std::size_t i = 0; i < get_enum_max<ModelType>(); ++i) {
+        const std::string cur = get_dynamic_enum_name(static_cast<ModelType>(i));
+        if (upper == cur) {
+            return static_cast<ModelType>(i);
+        }
+        names += (i ? ", " : "") + cur;
+    }
+    STD_TORCH_CHECK(false, "Unknown kv_format: ", name, ". Expected one of ", names);
+}
+
+// The format of a paged quantized KV cache with d_qk = 512, detected by bytes_per_token (kv.size(3)). V4.1 and
+// V3.2-no-RoPE are both 528 B per token: `preferred` wins when its size matches, otherwise 528 B is V4.1.
+inline ModelType detect_kv_cache_format_for_headdim_512(int bytes_per_token, std::optional<ModelType> preferred = std::nullopt) {
+    if (preferred.has_value() && bytes_per_token == kv_cache_bytes_per_token(*preferred)) {
+        return *preferred;
+    }
     for (ModelType mt : {ModelType::V41, ModelType::V41_FP4}) {
         if (bytes_per_token == kv_cache_bytes_per_token(mt)) {
             return mt;

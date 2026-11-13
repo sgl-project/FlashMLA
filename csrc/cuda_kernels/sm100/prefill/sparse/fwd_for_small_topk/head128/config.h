@@ -76,7 +76,7 @@ template<typename F, int CTA> using KVPart = KVCachePart<F, 2, CTA>;
 template<typename F> static constexpr int RAW_TOKEN_SMEM_STRIDE = F::QUANT_BYTES/2 + 32;
 // One tma_gather4 writes its 4 rows RAW_TOKEN_SMEM_STRIDE apart, and its destination must be 128 B aligned
 static_assert(4 * RAW_TOKEN_SMEM_STRIDE<OrigKVFormat> % 128 == 0 && 4 * RAW_TOKEN_SMEM_STRIDE<ExtraKVFormat> % 128 == 0);
-static constexpr int SCALE_STAGE_ROW_BYTES = std::max(KVPart<OrigKVFormat, 0>::NUM_SCALES, KVPart<ExtraKVFormat, 0>::NUM_SCALES);
+static constexpr int SCALE_STAGE_ROW_BYTES = std::max(KVPart<OrigKVFormat, 0>::SCALE_BYTES_PART, KVPart<ExtraKVFormat, 0>::SCALE_BYTES_PART);
 // The scale stage follows the entire TMA tile, including its zero-filled padding.
 static constexpr int SCALE_STAGE_OFFSET = B_TOPK * std::max(RAW_TOKEN_SMEM_STRIDE<OrigKVFormat>, RAW_TOKEN_SMEM_STRIDE<ExtraKVFormat>);
 static constexpr int RAW_BUFFER_BYTES = SCALE_STAGE_OFFSET + B_TOPK * SCALE_STAGE_ROW_BYTES;
