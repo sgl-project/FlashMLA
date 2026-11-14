@@ -33,9 +33,11 @@ def gen_testcase() -> List[RawTestParam]:
         for kvcache_layout, extra_kvcache_layout in [
             (quant.KVCacheLayout.V41_FP8Sparse, None),
             (quant.KVCacheLayout.V41_FP8Sparse, quant.KVCacheLayout.V41_FP4Sparse),   # fp4 extra_kv_cache
+            (quant.KVCacheLayout.V32_FP8Sparse, None),    # V3.2 (Kimi-K3.1): head128 only
         ]:
             if extra_kvcache_layout is not None and not have_extra_k:
                 continue    # The extra layout is meaningless without an extra cache
+            d_qk = kvcache_layout.get_meta()[0]
             for h_q in [64, 128]:
                 have_topk_len = random.choice([False, True])
                 have_extra_topk_len = random.choice([False, True, True]) if have_extra_k else False
@@ -48,7 +50,7 @@ def gen_testcase() -> List[RawTestParam]:
                                 block_size=block_size,
                                 extra_block_size=extra_block_size,
                                 have_extra_topk_length=have_extra_topk_len,
-                                d_qk=512,
+                                d_qk=d_qk,
                                 kvcache_layout=kvcache_layout,
                                 extra_kvcache_layout=extra_kvcache_layout,
                                 check_correctness=True,
@@ -87,7 +89,7 @@ def gen_testcase() -> List[RawTestParam]:
                                 block_size=block_size,
                                 extra_block_size=extra_block_size,
                                 have_extra_topk_length=have_extra_topk_len,
-                                d_qk=512,
+                                d_qk=d_qk,
                                 kvcache_layout=kvcache_layout,
                                 extra_kvcache_layout=extra_kvcache_layout,
                                 check_correctness=True,
@@ -326,7 +328,7 @@ def main():
             str(testcase.s_kv),
             str(testcase.d_qk),
             " V"[testcase.decode.is_varlen] + " L"[testcase.have_topk_length] + " E"[testcase.decode.have_extra_topk_length],
-            "FP8+FP4" if testcase.decode.extra_kvcache_layout == quant.KVCacheLayout.V41_FP4Sparse else "FP8",
+            "FP8+FP4" if testcase.decode.extra_kvcache_layout == quant.KVCacheLayout.V41_FP4Sparse else "V32" if testcase.decode.kvcache_layout == quant.KVCacheLayout.V32_FP8Sparse else "FP8",
             f"{result.compute_memory_ratio:3.0f}",
             f"{result.achieved_tflops:3.0f}",
             f"{result.achieved_gBps:4.0f}",

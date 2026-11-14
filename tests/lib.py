@@ -86,7 +86,10 @@ class TestParam:
             cc_major, cc_minor = get_current_compute_capability()
             if cc_major != 10:
                 return False    # Only sm100a / sm103a is supported
-            if self.h_q not in (64, 128) or self.d_qk != 512:
+            if self.decode is not None and self.decode.kvcache_layout == quant.KVCacheLayout.V32_FP8Sparse:
+                if self.h_q != 128 or self.d_qk != 576:   # V3.2: head128 only
+                    return False
+            elif self.h_q not in (64, 128) or self.d_qk != 512:
                 return False
 
             if test_target == TestTarget.SPARSE_FWD:
