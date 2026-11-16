@@ -86,7 +86,10 @@ class TestParam:
             cc_major, cc_minor = get_current_compute_capability()
             if cc_major != 10:
                 return False    # Only sm100a / sm103a is supported
-            if self.h_q not in (64, 128) or self.d_qk != 512:
+            if self.decode is not None and self.decode.kvcache_layout == quant.KVCacheLayout.V32_FP8Sparse:
+                if self.h_q != 128 or self.d_qk != 576:   # V3.2: head128 only
+                    return False
+            elif self.h_q not in (64, 128) or self.d_qk != 512:
                 return False
 
             if test_target == TestTarget.SPARSE_FWD:
@@ -95,8 +98,6 @@ class TestParam:
                 return True
             elif test_target == TestTarget.DECODE:
                 assert self.decode is not None
-                if self.decode.kvcache_layout == quant.KVCacheLayout.V32_NO_ROPE_FP8Sparse:
-                    return self.h_q == 128   # head128 only
                 return True
             else:
                 raise RuntimeError(f"Unknown test_target: {test_target}")
@@ -419,8 +420,7 @@ def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_meta
         extra_k_cache=t.extra_kv_scope.get_kvcache_for_flash_mla() if t.extra_kv_scope is not None else None,
         extra_indices_in_kvcache=squeeze(t.extra_kv_scope.indices_in_kvcache[bsz_start: bsz_end] if t.extra_kv_scope is not None else None),
         topk_length=repeat_b_by_s_q(t.kv_scope.topk_length[bsz_start: bsz_end] if t.kv_scope.topk_length is not None else None),
-        extra_topk_length=repeat_b_by_s_q(t.extra_kv_scope.topk_length[bsz_start: bsz_end] if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None),
-        kv_format="V32_NO_ROPE" if p.decode.kvcache_layout == quant.KVCacheLayout.V32_NO_ROPE_FP8Sparse else None,
+        extra_topk_length=repeat_b_by_s_q(t.extra_kv_scope.topk_length[bsz_start: bsz_end] if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None)
     )
 
     if squeeze_s_q_with_b:

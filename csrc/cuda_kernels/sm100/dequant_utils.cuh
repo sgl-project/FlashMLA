@@ -96,7 +96,8 @@ struct KVBlockDequantizer {
                         data_bf16[i] = __hmul2(data_bf16[i], scale);   // Exact: e2m1 x e4m3 has at most 2 + 4 significant bits
                 } else {
                     const int scale_idx = scale_idx_base + (F::QUANT_TILE_SIZE == 32 ? idx_in_group >= GROUP_SIZE / 2 : 0);
-                    if constexpr (F::IS_V32_NO_ROPE) {
+                    if constexpr (F::SCALE_BYTES == 4) {
+                        // fp32 scales: rounded to bf16, then applied in bf16, as the legacy V3.2 kernels do
                         const ku::nvbf16x2 scale = __float2bfloat162_rn(((const float*)scales_row)[scale_idx]);
                         CUTE_UNROLL
                         for (int i = 0; i < 4; ++i) {

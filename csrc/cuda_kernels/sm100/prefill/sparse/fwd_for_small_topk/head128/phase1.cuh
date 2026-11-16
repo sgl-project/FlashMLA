@@ -365,10 +365,19 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                     smem.Q.data(),
                     0, cta_idx*(H_Q/2), 0, 0, (IS_DECODE ? args.batch_idx*stride_q_b_div_stride_q_s_q : 0) + args.s_q_idx
                 );
+                if constexpr (HAS_ROPE_BF16) {
+                    SM100_TMA_2SM_LOAD_4D_NOSPLIT::copy(
+                        &tma_params.rope.tensor_map_q_rope,
+                        (uint64_t*)&smem.bar_sQ_full,
+                        (uint64_t)TMA::CacheHintSm90::EVICT_FIRST,
+                        smem.rope.Q_rope.data(),
+                        0, cta_idx*(H_Q/2), 0, args.batch_idx*stride_q_b_div_stride_q_s_q + args.s_q_idx
+                    );
+                }
 
                 // Wait for sQ to be ready, and issue S -> T copy for Q
                 if (cta_idx == 0) {
-                    smem.bar_sQ_full.arrive_and_expect_tx(H_Q*D_Q*sizeof(bf16));
+                    smem.bar_sQ_full.arrive_and_expect_tx(H_Q*(D_Q + D_ROPE_BF16)*sizeof(bf16));
                     smem.bar_sQ_full.wait(args.outer_loop_phase);
 
                     smem.bar_tQ_empty.wait(args.outer_loop_phase^1);
@@ -394,6 +403,24 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                             SM100_UTCCP_128dp256bit_2cta::copy(
                                 cur_sQ_desc,
                                 tmem_cols::Q + tile_idx*32 + subtile_idx*8
+                            );
+                        }
+                    }
+                    if constexpr (HAS_ROPE_BF16) {
+                        // Rows 0~63 (RoPE dims [0, 32)) pair with CTA0's K RoPE half, rows 64~127 with CTA1's, as for the NoPE dims
+                        UMMA::SmemDescriptor sQ_rope_desc = UMMA::make_umma_desc<UMMA::Major::K>(
+                            make_tensor(
+                                make_smem_ptr(smem.rope.Q_rope.data()),
+                                ku::make_umma_canonical_k_major_layout<(H_Q/2)*2, D_ROPE_BF16/2, 64>()
+                            )
+                        );
+                        CUTE_UNROLL
+                        for (int subtile_idx = 0; subtile_idx < (D_ROPE_BF16/2)/16; ++subtile_idx) {
+                            UMMA::SmemDescriptor cur_sQ_rope_desc = sQ_rope_desc;
+                            asm volatile ("add.u32 %0, %0, %1;" : "+r"(cur_sQ_rope_desc.lo) : "r"((subtile_idx*32) >> 4));
+                            SM100_UTCCP_128dp256bit_2cta::copy(
+                                cur_sQ_rope_desc,
+                                tmem_cols::Q_ROPE + subtile_idx*8
                             );
                         }
                     }
@@ -498,6 +525,14 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                         cute::cast_smem_ptr_to_uint(smem.K[k_buf_idx].data()),
                         [&] { smem.bar_KV_empty[k_buf_idx].wait(k_bar_phase^1); }
                     );
+                    if constexpr (HAS_ROPE_BF16) {
+                        const uint8_t *rope_src = (raw_k_buf_idx == 0 ? raw_0 : raw_1) + ROPE_STAGE_OFFSET;
+                        uint8_t *rope_dst = (uint8_t*)smem.rope.K_rope[k_buf_idx].data();
+                        CUTE_UNROLL
+                        for (int ofs = idx_in_warpgroup*16; ofs < ROPE_STAGE_BYTES; ofs += 128*16) {
+                            *(int4*)(rope_dst + ofs) = *(const int4*)(rope_src + ofs);
+                        }
+                    }
 
                     fence_view_async_shared();  // NOTE Should we use shared::cluster here?
                     __syncwarp();
@@ -545,7 +580,20 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                         make_smem_ptr(smem.K[k_buf_idx].data()),
                         ku::make_umma_canonical_k_major_layout<B_TOPK, D_K/2, 128>()
                     );
-                    ku::utcmma_ts(tiled_mma_P, tQ, sK, tP, true);
+                    if constexpr (HAS_ROPE_BF16) {
+                        Tensor tQ_rope = tiled_mma_P.get_slice(_0{}).make_fragment_A(
+                            partition_shape_A(tiled_mma_P, Shape<Int<H_Q/2>, Int<D_ROPE_BF16/2>>{})
+                        );
+                        tQ_rope.data().get() = tmem_cols::Q_ROPE;
+                        Tensor sK_rope = make_tensor(
+                            make_smem_ptr(smem.rope.K_rope[k_buf_idx].data()),
+                            ku::make_umma_canonical_k_major_layout<B_TOPK, D_ROPE_BF16/2, 64>()
+                        );
+                        ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope, tP, true);
+                        ku::utcmma_ts(tiled_mma_P, tQ, sK, tP, false);
+                    } else {
+                        ku::utcmma_ts(tiled_mma_P, tQ, sK, tP, true);
+                    }
                     ku::umma_arrive_multicast_2x1SM_noelect(smem.bar_QK_done, 1|2);
                 };
 
@@ -741,9 +789,16 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                                         tensor_map, smem.bar_raw_KV_full[raw_k_buf_idx],
                                         raw + row*RAW_TOKEN_SMEM_STRIDE<F>, 0, cur_indices,
                                         (int64_t)TMA::CacheHintSm90::EVICT_FIRST);
+                                    if constexpr (HAS_ROPE_BF16) {
+                                        ku::tma_gather4(
+                                            is_extra_block ? &tma_params.rope.tensor_map_extra_kv_rope : &tma_params.rope.tensor_map_kv_rope,
+                                            smem.bar_raw_KV_full[raw_k_buf_idx],
+                                            raw + ROPE_STAGE_OFFSET + row*(D_ROPE_BF16/2)*sizeof(bf16), cta_idx*(D_ROPE_BF16/2), cur_indices,
+                                            (int64_t)TMA::CacheHintSm90::EVICT_FIRST);
+                                    }
                                 }
                                 if (warp_idx == 10) {
-                                    smem.bar_raw_KV_full[raw_k_buf_idx].arrive_and_expect_tx(B_TOPK*RAW_TOKEN_SMEM_STRIDE<F>);
+                                    smem.bar_raw_KV_full[raw_k_buf_idx].arrive_and_expect_tx(B_TOPK*RAW_TOKEN_SMEM_STRIDE<F> + ROPE_STAGE_BYTES);
                                 }
                             }
                             smem.bar_valid_coord_empty[index_buf_idx].arrive();
@@ -916,7 +971,7 @@ void KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::run(const ArgT& par
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
     KU_ASSERT(params.h_q == H_Q);  // To save some calculation
-    KU_ASSERT(params.d_qk == D_QK);
+    KU_ASSERT(params.d_qk == D_QK + D_ROPE_BF16);
     if constexpr (IS_DECODE) {
         KU_ASSERT(params.model_type == MODEL_TYPE && params.extra_model_type == EXTRA_MODEL_TYPE);
     }
@@ -1027,8 +1082,28 @@ void KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::run(const ArgT& par
             tensor_map_o,
             tensor_map_o_accum,
             {tensor_map_kv_quant_part[0], tensor_map_kv_quant_part[1]},
-            {tensor_map_extra_kv_quant_part[0], tensor_map_extra_kv_quant_part[1]}
+            {tensor_map_extra_kv_quant_part[0], tensor_map_extra_kv_quant_part[1]},
+            {}
         };
+        if constexpr (HAS_ROPE_BF16) {
+            // [D_ROPE_BF16/2 dims, H_Q heads, 2 halves, rows]: one 2-CTA box puts each CTA's 64 heads' two RoPE halves in 128 SW64 rows
+            const bool one_row = params.b == 1;
+            tma_params.rope.tensor_map_q_rope = ku::make_tensor_map(
+                {(uint64_t)(D_ROPE_BF16/2), (uint64_t)H_Q, 2ul, one_row ? (uint64_t)params.s_q : (uint64_t)params.b * (params.stride_q_b / params.stride_q_s_q)},
+                ku::make_stride_helper<int>({params.stride_q_h_q, D_ROPE_BF16/2, one_row && params.s_q == 1 ? 0 : params.stride_q_s_q}, sizeof(bf16)),
+                {D_ROPE_BF16/2, H_Q/2, 2, 1},
+                (bf16*)params.q + D_Q,
+                CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                CU_TENSOR_MAP_SWIZZLE_64B,
+                CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+            );
+            tma_params.rope.tensor_map_kv_rope = make_kv_bf16_part_tensor_map<OrigKVFormat, D_ROPE_BF16/2, 64>(
+                "k_cache", params.kv, params.num_blocks, params.stride_kv_block);
+            if (params.extra_topk > 0) {
+                tma_params.rope.tensor_map_extra_kv_rope = make_kv_bf16_part_tensor_map<ExtraKVFormat, D_ROPE_BF16/2, 64>(
+                    "extra_k_cache", params.extra_kv, params.extra_num_blocks, params.stride_extra_kv_block);
+            }
+        }
     } else {
         tma_params = {
             tensor_map_q,
@@ -1045,6 +1120,7 @@ void KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::run(const ArgT& par
         kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KT>;
     }
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+    static_assert(smem_size <= 227*1024);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     dim3 grid_shape;

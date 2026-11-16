@@ -33,12 +33,21 @@ struct TmaParamsForPrefill {
     CUtensorMap tensor_map_o;
 };
 
+// Decode with V3.2's bf16 RoPE part: Q's RoPE dims and each cache's RoPE part (see HAS_ROPE_BF16)
+struct TmaRopeMaps {
+    CUtensorMap tensor_map_q_rope;
+    CUtensorMap tensor_map_kv_rope;
+    CUtensorMap tensor_map_extra_kv_rope;   // Only available if extra_kv is enabled
+};
+struct NoTmaRopeMaps {};
+
 struct TmaParamsForDecode {
     CUtensorMap tensor_map_q;
     CUtensorMap tensor_map_o;
     CUtensorMap tensor_map_o_accum;
     CUtensorMap tensor_map_kv_quant_part[2];        // One map per CTA: each CTA of the pair gathers its half of the token
     CUtensorMap tensor_map_extra_kv_quant_part[2];  // Only available if extra_kv is enabled
+    [[no_unique_address]] std::conditional_t<is_decode_v<FWD_MODE> && KVCacheFormat<MODEL_TYPE>::D_BF16 != 0, TmaRopeMaps, NoTmaRopeMaps> rope;
 };
 
 using TmaParams = std::conditional_t<
@@ -50,8 +59,13 @@ using TmaParams = std::conditional_t<
 using OrigKVFormat = KVCacheFormat<MODEL_TYPE>;         // Format of `kv`, decode only
 using ExtraKVFormat = KVCacheFormat<EXTRA_MODEL_TYPE>;  // Format of the paged `extra_kv`, decode only
 static_assert(is_valid_kv_format_pair(MODEL_TYPE, EXTRA_MODEL_TYPE));
-static_assert(OrigKVFormat::D_QK == D_QK);
+static_assert(OrigKVFormat::D_QUANT == D_QK);
 static_assert(ExtraKVFormat::D_FP8 + ExtraKVFormat::D_FP4 == OrigKVFormat::D_FP8);
+// V3.2 decode: 64 more QK dims, stored as bf16 after the scales (V stays the 512 quantized dims). The pair splits
+// them like the quantized dims: CTA c holds RoPE dims [c*D_ROPE_BF16/2, +D_ROPE_BF16/2), and QK adds one MMA over them
+static constexpr int D_ROPE_BF16 = IS_DECODE ? OrigKVFormat::D_BF16 : 0;
+static constexpr bool HAS_ROPE_BF16 = D_ROPE_BF16 > 0;
+static_assert(!HAS_ROPE_BF16 || ExtraKVFormat::D_BF16 == D_ROPE_BF16);
 
 static constexpr int D_Q = D_QK;
 static constexpr int D_K = D_QK;
@@ -64,8 +78,9 @@ static constexpr int NUM_THREADS = 128*4;
 static constexpr int NUM_WORKER_THREADS = IS_PREFILL ? (128 + 4 + (B_TOPK/8) + 1 + 128)*2 + 1 : (128 + 128 + 1 + 32 + 1 + 32 + 128)*2 - 1;
 
 // For non-decode mode, we have 4 (half-)KV buffers
-// For decode mode, we have 3 (half-)KV buffers with two raw KV buffers
-static constexpr int NUM_K_BUFS = IS_DECODE ? 3 : 4;
+// For decode mode, we have 3 (half-)KV buffers with two raw KV buffers (2 with a RoPE part, which needs the space)
+static constexpr int NUM_K_BUFS = IS_DECODE ? (HAS_ROPE_BF16 ? 2 : 3) : 4;
+static constexpr int ROPE_STAGE_BYTES = B_TOPK * (D_ROPE_BF16/2) * sizeof(bf16);   // One CTA's RoPE half of a KV block
 static constexpr int NUM_RAW_K_BUFS = IS_DECODE ? 2 : 0;
 static constexpr int NUM_INDEX_BUFS = IS_DECODE ? 4 : 4;
 
@@ -79,7 +94,10 @@ static_assert(4 * RAW_TOKEN_SMEM_STRIDE<OrigKVFormat> % 128 == 0 && 4 * RAW_TOKE
 static constexpr int SCALE_STAGE_ROW_BYTES = std::max(KVPart<OrigKVFormat, 0>::SCALE_BYTES_PART, KVPart<ExtraKVFormat, 0>::SCALE_BYTES_PART);
 // The scale stage follows the entire TMA tile, including its zero-filled padding.
 static constexpr int SCALE_STAGE_OFFSET = B_TOPK * std::max(RAW_TOKEN_SMEM_STRIDE<OrigKVFormat>, RAW_TOKEN_SMEM_STRIDE<ExtraKVFormat>);
-static constexpr int RAW_BUFFER_BYTES = SCALE_STAGE_OFFSET + B_TOPK * SCALE_STAGE_ROW_BYTES;
+// The RoPE stage (SW64, gathered by TMA) has the same 1024 B phase as K_rope, so the dequant warpgroup copies it as is
+static constexpr int ROPE_STAGE_OFFSET = (SCALE_STAGE_OFFSET + B_TOPK * SCALE_STAGE_ROW_BYTES + 1023) / 1024 * 1024;
+static constexpr int RAW_BUFFER_BYTES = HAS_ROPE_BF16 ? ROPE_STAGE_OFFSET + ROPE_STAGE_BYTES : SCALE_STAGE_OFFSET + B_TOPK * SCALE_STAGE_ROW_BYTES;
+static constexpr int RAW_BUFFER_ALIGN = HAS_ROPE_BF16 ? 1024 : 128;
 template<typename F> using DequantizerT = KVBlockDequantizer<F, D_K/2, B_TOPK, RAW_TOKEN_SMEM_STRIDE<F>, RAW_TOKEN_SMEM_STRIDE<F>>;
 
 static constexpr int B_EPI = 64;                // Epilogue block size for normal case (i.e. prefill or non-splitkv decoding)
@@ -92,16 +110,25 @@ struct tmem_cols {
     //   0 ~ 256: Output accumulator
     // 256 ~ 384: Q
     // 384 ~ 448: P
+    // 448 ~ 464: Q's RoPE part (V3.2 decode)
     static constexpr int O = 0;
     static constexpr int Q = 256;
     static constexpr int P = 384;
+    static constexpr int Q_ROPE = 448;
 };
+
+// K's RoPE halves (one per K buffer) and Q's RoPE part, both SW64; empty without a RoPE part
+struct RopeSmem {
+    array_aligned<bf16, B_TOPK * (D_ROPE_BF16/2), 1024> K_rope[NUM_K_BUFS];
+    array_aligned<bf16, H_Q * (D_ROPE_BF16/2), 1024> Q_rope;   // [2][H_Q/2][D_ROPE_BF16/2]: rows 0~63 hold RoPE dims [0, 32), rows 64~127 [32, 64)
+};
+struct NoRopeSmem {};
 
 struct SharedMemoryPlan {
     array_aligned<bf16, B_TOPK*(D_K/2)> K[NUM_K_BUFS];
     array_aligned<bf16, (H_Q/2)*B_TOPK> S;
     array_aligned<bf16, (H_Q/2)*D_Q> Q; // Will be output for epilogue
-    array_aligned<uint8_t, RAW_BUFFER_BYTES, 128> K_raw[NUM_RAW_K_BUFS];
+    array_aligned<uint8_t, RAW_BUFFER_BYTES, RAW_BUFFER_ALIGN> K_raw[NUM_RAW_K_BUFS];
     float P_exchange[4][(H_Q/2/2)*(B_TOPK/2)];
     float rowwise_max_buf[128], rowwise_li_buf[128];
 
@@ -125,6 +152,8 @@ struct SharedMemoryPlan {
 
     ku::CLCResponseObj clc_response_obj;
     array_aligned<uint32_t, 1> tmem_start_addr;
+
+    [[no_unique_address]] std::conditional_t<HAS_ROPE_BF16, RopeSmem, NoRopeSmem> rope;
 };
 
 using TiledMMA_P = decltype(make_tiled_mma(

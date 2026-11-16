@@ -36,6 +36,24 @@ CUTE_DEVICE void copy_kv_scales_async(uint8_t *dst, const uint8_t *scales, int c
     cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<CopyT>::copy(*(const CopyT*)src, *(CopyT*)dst, coord >= 0);
 }
 
+// The bf16 part of each token (V3.2's RoPE), BOX_ELEMS columns per gather4 row, swizzled as SWIZZLE bytes for UMMA.
+template<typename F, int BOX_ELEMS, int SWIZZLE>
+static CUtensorMap make_kv_bf16_part_tensor_map(const char *name, void *kv, int num_blocks, int64_t block_stride_bytes) {
+    static_assert(F::D_BF16 > 0 && SWIZZLE == 64 && BOX_ELEMS * 2 == SWIZZLE);
+    static_assert(F::BYTES_PER_TOKEN % 16 == 0 && F::BF16_OFFSET % 16 == 0);
+    KU_ASSERT((int64_t)kv % 16 == 0, "The base address of %s (%p) must be 16B aligned", name, kv);
+    KU_ASSERT(block_stride_bytes % F::BYTES_PER_TOKEN == 0, "%s.stride(0) (%ld) must be a multiple of %d", name, block_stride_bytes, F::BYTES_PER_TOKEN);
+    return ku::make_tensor_map(
+        {(uint64_t)F::D_BF16, (uint64_t)num_blocks * (uint64_t)(block_stride_bytes / F::BYTES_PER_TOKEN)},
+        {(uint64_t)F::BYTES_PER_TOKEN},
+        {BOX_ELEMS, 1},
+        (uint8_t*)kv + F::BF16_OFFSET,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        CU_TENSOR_MAP_SWIZZLE_64B,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B
+    );
+}
+
 // UINT32 keeps the TMA box dimension <= 256. Each gather4 writes four BOX_BYTES rows;
 // bytes beyond Part's view are zero-filled. The caller aligns each gather4 destination to 128 B.
 template<typename Part, int BOX_BYTES>
