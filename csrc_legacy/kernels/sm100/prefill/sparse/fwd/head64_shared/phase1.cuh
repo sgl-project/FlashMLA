@@ -909,8 +909,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnSmallHeadsFwdParams par
 #else // FLASH_MLA_SMALL_HEADS
 sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __grid_constant__ const TmaParams tma_params) {
 #endif // FLASH_MLA_SMALL_HEADS
-#if FLASH_MLA_TARGET == 107 && !defined(CUTLASS_ARCH_MMA_SM107A_ENABLED) && !defined(CUTLASS_ARCH_MMA_SM107F_ENABLED)
-    // Never launched: can_use_oversized_smem() requires an sm_107 device
+#if FLASH_MLA_TARGET == 107 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 1070
+    // Never launched: can_use_oversized_smem() requires an sm_107 device. The compiler's __CUDA_ARCH__ (not a
+    // CUTLASS feature macro) selects the passes, so every sm_107 device pass compiles the body.
 #else
     Kernel::sparse_attn_fwd_kernel_devfunc(params, tma_params);
 #endif
