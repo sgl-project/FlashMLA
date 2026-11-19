@@ -229,7 +229,7 @@ static void run(const SparseAttnFwdParams& params);
 #endif // FLASH_MLA_SMALL_HEADS
 
 #if FLASH_MLA_TARGET == 107
-// Whether the current device can run this sm_107 copy
+// Whether the current device runs this file's sm_107 binary and has the shared memory this copy needs
 static bool can_use_oversized_smem();
 #endif
 

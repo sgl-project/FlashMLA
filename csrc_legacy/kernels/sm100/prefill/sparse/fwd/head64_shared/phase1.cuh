@@ -276,7 +276,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                     tmem_cols::Q_RoPE + subtile_idx*8
                 );
             }
+#if FLASH_MLA_TARGET != 107
             ku::umma_arrive_noelect(plan.bar_prologue_utccp_rope);
+#endif  // The sm_107 copy stages Q RoPE in its own slot, so no K RoPE load waits for this UTCCP
         }
     };
 
@@ -718,13 +720,21 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
             run_outer_loop([&](const OuterloopArgs &args) {
                 // Copy Q into k["buffer idx of the 1st block"+1]
                 // NOTE. As we reach here, we must have already issued the last O gemm of the last round, which means that the penultimate O gemm must be finished (since the last O gemm |-> bar_so_ready (the last S is ready) |-> the penultimate O gemm must be finished). So the corresponding K buffer must be free.
+#if FLASH_MLA_TARGET == 107
+                // For the RoPE part, Q RoPE has its own slot. The last round's UTCCP from it is done: the commit for that round's last P, issued after it, was waited on before the last S became ready.
+#else
                 // For the RoPE part, as we reach here, the last S from the last round must be ready, which means that the corresponding K RoPE buffer must be free.
+#endif
                 int q_slot_idx = rs.offset_by(+1).get<NUM_BUFS>().first;
                 issue_q_rope_tma(args.s_q_idx);
                 issue_q_nope_tma(args.s_q_idx, q_slot_idx);
                 issue_q_rope_utccp(args.outer_loop_phase);
                 issue_q_nope_utccp(args.outer_loop_phase, q_slot_idx);
+#if FLASH_MLA_TARGET == 107
+                // NOTE Nothing waits for Q RoPE's UTCCP: K RoPE tiles go to their own slots, not Q RoPE's
+#else
                 // NOTE Here we don't need to wait for bar_prologue_utccp_rope, since the copy-in of the first RoPE relies on bar_prologue_utccp_rope
+#endif
 
                 CUTE_NO_UNROLL
                 for (int k = 0; k < args.num_k_blocks+1; ++k) {
@@ -910,8 +920,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnSmallHeadsFwdParams par
 sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __grid_constant__ const TmaParams tma_params) {
 #endif // FLASH_MLA_SMALL_HEADS
 #if FLASH_MLA_TARGET == 107 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 1070
-    // Never launched: can_use_oversized_smem() requires an sm_107 device. The compiler's __CUDA_ARCH__ (not a
-    // CUTLASS feature macro) selects the passes, so every sm_107 device pass compiles the body.
+    // Never launched: can_use_oversized_smem() requires the device to run this file's sm_107 code. __CUDA_ARCH__
+    // (not a CUTLASS feature macro) selects the passes: every sm_107 pass compiles the body, any other traps.
+    __trap();
 #else
     Kernel::sparse_attn_fwd_kernel_devfunc(params, tma_params);
 #endif
@@ -1038,23 +1049,33 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const SparseAttnFwdParams& params) {
 }
 
 #if FLASH_MLA_TARGET == 107
+// Built with the same gencode list as the kernels in this file, so the driver picks the same binary for it
+template<int UNUSED>
+__global__ void sm107_binary_probe_kernel() {}
+
 template<FwdMode FWD_MODE, int D_QK>
 bool KernelTemplate<FWD_MODE, D_QK>::can_use_oversized_smem() {
 #if CUDART_VERSION >= 13040
-    // The library carries sm_107a code whenever it runs on an sm_107 device, so the device check covers the build
+    // As core_attn does: use this copy only when the device runs its sm_107 binary, not other (e.g. family) code
     auto probe = [](int device) -> bool {
         const char *disable = std::getenv("FLASH_MLA_DISABLE_OVERSIZED_SMEM");
         if (disable != nullptr && std::strcmp(disable, "1") == 0) {
             return false;
         }
-        int major = 0, minor = 0, max_oversized_smem = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&max_oversized_smem, cudaDevAttrOversizedSharedMemoryPerBlock, device) != cudaSuccess) {
+        int max_oversized_smem = 0;
+        if (cudaDeviceGetAttribute(&max_oversized_smem, cudaDevAttrOversizedSharedMemoryPerBlock, device) != cudaSuccess) {
             (void)cudaGetLastError();
             return false;
         }
-        return major == 10 && minor == 7 && (size_t)max_oversized_smem >= sizeof(SharedMemoryPlan);
+        if ((size_t)max_oversized_smem < sizeof(SharedMemoryPlan)) {
+            return false;
+        }
+        cudaFuncAttributes func_attrs;
+        if (cudaFuncGetAttributes(&func_attrs, &sm107_binary_probe_kernel<0>) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        return func_attrs.binaryVersion == 107;
     };
     static constexpr int MAX_DEVICES = 16;
     static std::once_flag probed[MAX_DEVICES];
