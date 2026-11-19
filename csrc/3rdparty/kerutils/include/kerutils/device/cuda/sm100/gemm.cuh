@@ -276,6 +276,215 @@ struct MMA_Traits<SM100_MMA_F16BF16_WS_SS_NOELECT<a_type, b_type, c_type,
 };
 
 
+// 8-bit (kind::f8f6f4) counterparts of SM100_MMA_F16BF16_WS_TS_NOELECT / SM100_MMA_F16BF16_WS_SS_NOELECT, used by the fp8
+// sparse prefill. Same operand forms and the same "no elect_one_sync() inside" convention; what changes is the instruction
+// kind and the K extent. The PTX ISA (tcgen05.mma, "Supported shapes and kinds") allows the .ws form for kind::f8f6f4 with
+// M = 32 / 64 / 128 and N = 64 / 128 / 256, a K of 256 bits per instruction (32 elements of an 8-bit type), A from TMEM
+// (TS, K-major only) or from shared memory (SS), and both K- and MN-major smem operands for the 8-bit formats. The a/b
+// formats of the instruction descriptor come from UMMA::make_instr_desc, i.e. MXF8F6F4Format::E4M3 for float_e4m3_t.
+// CUTLASS 2c85f49 has kind::f8f6f4 atoms only without .ws (SM100_MMA_F8F6F4_SS / _TS, which also elect a thread inside).
+template <class a_type, class b_type, class c_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          int FOLD_DEGREE_A = 1,
+          UMMA::ScaleIn a_neg = UMMA::ScaleIn::One, UMMA::ScaleIn b_neg = UMMA::ScaleIn::One>
+struct SM100_MMA_F8F6F4_WS_TS_NOELECT
+{
+  static_assert(M == 32 || M == 64 || M == 128, "SM100_MMA_F8F6F4_WS_TS_NOELECT M-mode size should be 32, 64 or 128 for 1 CTA cluster MMA.");
+  static_assert(N == 64 || N == 128 || N == 256,
+                "SM100_MMA_F8F6F4_WS_TS_NOELECT N-mode size should be 64, 128 or 256");
+  static_assert(a_major == UMMA::Major::K, "SM100_MMA_F8F6F4_WS_TS_NOELECT: A from TMEM is K-major");
+
+  using DRegisters = void;
+  using ARegisters = uint64_t[1];
+  using BRegisters = uint64_t[1];
+  using CRegisters = uint32_t[1];
+
+  CUTE_HOST_DEVICE static void
+  fma(uint32_t const& tmem_a,
+      uint64_t const& desc_b,
+      uint32_t const& tmem_c,
+      uint32_t const& scaleC,
+      uint64_t const& idescE)
+  {
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.ws.cta_group::1.kind::f8f6f4 [%0], [%1], %2, %3, p, 0; \n\t"
+      "}\n"
+      :
+      : "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC));
+  }
+};
+
+template <class a_type, class b_type, class c_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          int FOLD_DEGREE_A,
+          UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg>
+struct MMA_Traits<SM100_MMA_F8F6F4_WS_TS_NOELECT<a_type, b_type, c_type,
+                                M, N,
+                                a_major, b_major,
+                                FOLD_DEGREE_A,
+                                a_neg, b_neg>>
+{
+  using ValTypeD = c_type;
+  using ValTypeA = a_type;
+  using ValTypeB = b_type;
+  using ValTypeC = c_type;
+  static_assert(cute::sizeof_bits_v<a_type> == 8 && cute::sizeof_bits_v<b_type> == 8, "SM100_MMA_F8F6F4_WS_TS_NOELECT supports 8bit types");
+
+  using FrgTypeA = UMMA::tmem_frg_elastic<a_type, a_type, FOLD_DEGREE_A>;
+  using FrgTypeB = UMMA::smem_desc<b_major>;
+  using FrgTypeC = UMMA::tmem_frg_elastic<c_type, uint32_t, 128/M>;
+
+  // Logical shape-K is always 256 bits; transform to units of elements (32 for 8-bit types)
+  static constexpr int K = 256 / cute::sizeof_bits<ValTypeA>::value;
+  static_assert(K == 32);
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_1>;
+  using ALayout = Layout<Shape <_1,Shape <Int<M>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+  using BLayout = Layout<Shape <_1,Shape <Int<N>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<N>>>>;
+  using CLayout = Layout<Shape <_1,Shape <Int<M>,Int<N>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  UMMA::InstrDescriptor idesc_ = UMMA::make_instr_desc<
+    a_type, b_type, c_type, M, N, a_major, b_major, a_neg, b_neg>();
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_tmem<TA>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint32_t tmem_a = raw_pointer_cast(A.data());
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
+
+    SM100_MMA_F8F6F4_WS_TS_NOELECT<a_type, b_type, c_type,
+                  M, N,
+                  a_major, b_major,
+                  FOLD_DEGREE_A,
+                  a_neg, b_neg>::fma(tmem_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
+  }
+};
+
+
+template <class a_type, class b_type, class c_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg = UMMA::ScaleIn::One, UMMA::ScaleIn b_neg = UMMA::ScaleIn::One>
+struct SM100_MMA_F8F6F4_WS_SS_NOELECT
+{
+  static_assert(M == 32 || M == 64 || M == 128, "SM100_MMA_F8F6F4_WS_SS_NOELECT M-mode size should be 32, 64 or 128 for 1 CTA cluster MMA.");
+  static_assert(N == 64 || N == 128 || N == 256,
+                "SM100_MMA_F8F6F4_WS_SS_NOELECT N-mode size should be 64, 128 or 256");
+
+  using DRegisters = void;
+  using ARegisters = uint64_t[1];
+  using BRegisters = uint64_t[1];
+  using CRegisters = uint32_t[1];
+
+  CUTE_HOST_DEVICE static void
+  fma(uint64_t const& desc_a,
+      uint64_t const& desc_b,
+      uint32_t const& tmem_c,
+      uint32_t const& scaleC,
+      uint64_t const& idescE)
+  {
+    asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.ws.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, p, 0; \n\t"
+      "}\n"
+      :
+      : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC));
+  }
+};
+
+template <class a_type, class b_type, class c_type,
+          int M, int N, UMMA::Major a_major, UMMA::Major b_major,
+          UMMA::ScaleIn a_neg, UMMA::ScaleIn b_neg>
+struct MMA_Traits<SM100_MMA_F8F6F4_WS_SS_NOELECT<a_type, b_type, c_type,
+                                M, N, a_major, b_major,
+                                a_neg, b_neg>>
+{
+  using ValTypeD = c_type;
+  using ValTypeA = a_type;
+  using ValTypeB = b_type;
+  using ValTypeC = c_type;
+
+  static_assert(cute::sizeof_bits_v<a_type> == 8 && cute::sizeof_bits_v<b_type> == 8, "SM100_MMA_F8F6F4_WS_SS_NOELECT supports 8bit types");
+
+  using FrgTypeA = UMMA::smem_desc<a_major>;
+  using FrgTypeB = UMMA::smem_desc<b_major>;
+  using FrgTypeC = UMMA::tmem_frg_elastic<c_type, uint32_t, 128/M>;
+
+  // Logical shape-K is always 256 bits; transform to units of elements (32 for 8-bit types)
+  static constexpr int K = 256 / cute::sizeof_bits<ValTypeA>::value;
+  static_assert(K == 32);
+
+  using Shape_MNK = Shape<Int<M>,Int<N>,Int<K>>;
+  using ThrID   = Layout<_1>;
+  using ALayout = Layout<Shape <_1,Shape <Int<M>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+  using BLayout = Layout<Shape <_1,Shape <Int<N>,Int<K>>>,
+                         Stride<_0,Stride<    _1,Int<N>>>>;
+  using CLayout = Layout<Shape <_1,Shape <Int<M>,Int<N>>>,
+                         Stride<_0,Stride<    _1,Int<M>>>>;
+
+  UMMA::InstrDescriptor idesc_ = UMMA::make_instr_desc<
+    a_type, b_type, c_type, M, N, a_major, b_major, a_neg, b_neg>();
+
+  // Accumulate or overwrite C.   1: read C, 0: ignore C [clear accumulators]
+  UMMA::ScaleOut accumulate_ = UMMA::ScaleOut::One;
+
+  template <class TD, class DLayout,
+            class TA, class ALayout,
+            class TB, class BLayout,
+            class TC, class CLayout>
+  CUTE_HOST_DEVICE constexpr friend
+  void
+  mma_unpack(MMA_Traits          const& traits,
+             Tensor<TD, DLayout>      & D,
+             Tensor<TA, ALayout> const& A,
+             Tensor<TB, BLayout> const& B,
+             Tensor<TC, CLayout> const& C)
+  {
+    static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
+    static_assert(is_rmem<TA>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_rmem<TB>::value, "Expected desc registers in MMA_Atom::call");
+    static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
+
+    uint64_t desc_a = A[0];
+    uint64_t desc_b = B[0];
+    uint32_t tmem_c = raw_pointer_cast(D.data());
+    uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
+
+    SM100_MMA_F8F6F4_WS_SS_NOELECT<a_type, b_type, c_type,
+                  M, N, a_major, b_major,
+                  a_neg, b_neg>::fma(desc_a, desc_b, tmem_c, uint32_t(traits.accumulate_), idesc);
+  }
+};
+
+
 template <class a_type, class b_type, class c_type,
           int M, int N, UMMA::Major a_major, UMMA::Major b_major,
           UMMA::ScaleIn a_neg = UMMA::ScaleIn::One, UMMA::ScaleIn b_neg = UMMA::ScaleIn::One,
