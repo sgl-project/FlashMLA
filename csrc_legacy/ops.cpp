@@ -28,10 +28,12 @@ STABLE_TORCH_LIBRARY(flash_mla_legacy, m) {
     m.def(
         "sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, "
         "Tensor? attn_sink=None, Tensor? topk_length=None, bool return_log2_stats=False, "
-        "bool return_stats=True) -> Tensor?[]");
+        "bool return_stats=True, Tensor? extra_kv=None, Tensor? extra_indices=None, "
+        "Tensor? extra_topk_length=None) -> Tensor?[]");
 
     m.def("sparse_prefill_fwd_small_heads(Tensor q, Tensor kv, Tensor indices, float sm_scale, "
-          "int active_heads, Tensor? attn_sink=None, Tensor? topk_length=None) -> Tensor?[]");
+          "int active_heads, Tensor? attn_sink=None, Tensor? topk_length=None, Tensor? extra_kv=None, "
+          "Tensor? extra_indices=None, Tensor? extra_topk_length=None) -> Tensor?[]");
 
     // --- Dense MLA decoding: SM90 only, and deleted upstream in the 2026.09.30 release -------
     m.def(

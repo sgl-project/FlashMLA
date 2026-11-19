@@ -1,5 +1,6 @@
 #include "common.h"
 #include "kernels/sm100/prefill/sparse/fwd/small_heads/phase1.h"
+#include "kernels/sm100/prefill/sparse/fwd/extra_kv/phase1.h"
 
 #include "kernels/params.h"
 
@@ -103,7 +104,10 @@ std::vector<std::optional<Tensor>> sparse_attn_prefill_impl(
     const std::optional<Tensor> &topk_length,
     bool return_log2_stats = false,
     bool return_stats = true,
-    int64_t active_heads = 0
+    int64_t active_heads = 0,
+    const std::optional<Tensor> &extra_kv = std::nullopt,
+    const std::optional<Tensor> &extra_indices = std::nullopt,
+    const std::optional<Tensor> &extra_topk_length = std::nullopt
 ) {
     using bf16 = cutlass::bfloat16_t;
     
@@ -152,7 +156,41 @@ std::vector<std::optional<Tensor>> sparse_attn_prefill_impl(
     KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
     KU_CHECK_LAST_DIM_CONTIGUOUS(attn_sink);
     KU_CHECK_LAST_DIM_CONTIGUOUS(topk_length);
-    
+
+    // Extra KV cache: each query also attends to the tokens extra_indices selects from extra_kv, in the same softmax
+    bool have_extra_kv = extra_kv.has_value();
+    STD_TORCH_CHECK(have_extra_kv == extra_indices.has_value(), "extra_kv and extra_indices must be given together");
+    STD_TORCH_CHECK(have_extra_kv || !extra_topk_length.has_value(), "extra_topk_length requires extra_kv");
+    int extra_s_kv = 0, extra_topk = 0;
+    if (have_extra_kv) {
+        STD_TORCH_CHECK(is_sm100f, "sparse MLA prefill with an extra KV cache requires SM10x");
+        STD_TORCH_CHECK(h_q == 64 && h_kv == 1 && d_qk == 576,
+            "sparse MLA prefill with an extra KV cache requires Q padded to 64 heads, one KV head and d_qk 576");
+        KU_CHECK_NDIM(extra_kv, 3);
+        KU_CHECK_NDIM(extra_indices, 3);
+        KU_CHECK_NDIM(extra_topk_length, 1);
+        extra_s_kv = extra_kv->size(0);
+        extra_topk = extra_indices->size(2);
+        STD_TORCH_CHECK(topk >= 128 && topk % 64 == 0 && extra_topk >= 128 && extra_topk % 64 == 0,
+            "with an extra KV cache, topk and extra_topk must be >= 128 and divisible by 64, got ", topk, " and ", extra_topk);
+        KU_CHECK_DEVICE(extra_kv);
+        KU_CHECK_DEVICE(extra_indices);
+        KU_CHECK_DEVICE(extra_topk_length);
+        for (const std::optional<Tensor> *t : {&extra_kv, &extra_indices, &extra_topk_length}) {
+            STD_TORCH_CHECK(!t->has_value() || (*t)->get_device_index() == q.get_device_index(),
+                "extra_kv, extra_indices and extra_topk_length must be on Q's device");
+        }
+        KU_CHECK_DTYPE(extra_kv, ScalarType::BFloat16);
+        KU_CHECK_DTYPE(extra_indices, ScalarType::Int);
+        KU_CHECK_DTYPE(extra_topk_length, ScalarType::Int);
+        KU_CHECK_SHAPE(extra_kv, extra_s_kv, 1, d_qk);
+        KU_CHECK_SHAPE(extra_indices, s_q, 1, extra_topk);
+        KU_CHECK_SHAPE(extra_topk_length, s_q);
+        KU_CHECK_LAST_DIM_CONTIGUOUS(extra_kv);
+        KU_CHECK_LAST_DIM_CONTIGUOUS(extra_indices);
+        KU_CHECK_LAST_DIM_CONTIGUOUS(extra_topk_length);
+    }
+
     // Allocate results and buffers
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
     
@@ -196,6 +234,28 @@ std::vector<std::optional<Tensor>> sparse_attn_prefill_impl(
         return_log2_stats,
         get_current_stream()
     };
+
+    if (have_extra_kv) {
+        SparseAttnExtraKvFwdParams extra_params{};
+        static_cast<SparseAttnFwdParams&>(extra_params) = params;
+        extra_params.active_heads = active_heads ? active_heads : h_q;
+        extra_params.output_heads = extra_params.active_heads;
+        extra_params.extra_kv = (bf16*)extra_kv->data_ptr();
+        extra_params.extra_indices = (int*)extra_indices->data_ptr();
+        extra_params.extra_topk_length = ku::get_optional_tensor_ptr<int>(extra_topk_length);
+        extra_params.extra_s_kv = extra_s_kv;
+        extra_params.extra_topk = extra_topk;
+        extra_params.stride_extra_kv_s_kv = int64_stride_to_int(extra_kv->stride(0));
+        extra_params.stride_extra_indices_s_q = int64_stride_to_int(extra_indices->stride(0));
+        if (s_q) {
+            if (active_heads) {
+                legacy::sm100::prefill::sparse_fwd::extra_kv::small_heads::run_sparse_fwd_phase1_kernel<SparseAttnFwdMode::Prefill, 576>(extra_params);
+            } else {
+                legacy::sm100::prefill::sparse_fwd::extra_kv::head64::run_sparse_fwd_phase1_kernel<SparseAttnFwdMode::Prefill, 576>(extra_params);
+            }
+        }
+        return {out, max_logits, lse};
+    }
 
     if (active_heads) {
         SparseAttnSmallHeadsFwdParams small_heads_params{};
@@ -267,18 +327,21 @@ std::vector<std::optional<Tensor>> sparse_attn_prefill_impl(
 std::vector<std::optional<Tensor>> sparse_attn_prefill_interface(
     const Tensor &q, const Tensor &kv, const Tensor &indices, double sm_scale,
     int64_t d_v, const std::optional<Tensor> &attn_sink,
-    const std::optional<Tensor> &topk_length, bool return_log2_stats, bool return_stats) {
+    const std::optional<Tensor> &topk_length, bool return_log2_stats, bool return_stats,
+    const std::optional<Tensor> &extra_kv, const std::optional<Tensor> &extra_indices,
+    const std::optional<Tensor> &extra_topk_length) {
     return sparse_attn_prefill_impl(q, kv, indices, sm_scale, d_v, attn_sink,
-        topk_length, return_log2_stats, return_stats);
+        topk_length, return_log2_stats, return_stats, 0, extra_kv, extra_indices, extra_topk_length);
 }
 
 std::vector<std::optional<Tensor>> sparse_prefill_fwd_small_heads(
     const Tensor &q, const Tensor &kv, const Tensor &indices, double sm_scale,
     int64_t active_heads, const std::optional<Tensor> &attn_sink,
-    const std::optional<Tensor> &topk_length) {
+    const std::optional<Tensor> &topk_length, const std::optional<Tensor> &extra_kv,
+    const std::optional<Tensor> &extra_indices, const std::optional<Tensor> &extra_topk_length) {
     STD_TORCH_CHECK(active_heads == 8 || active_heads == 32, "active_heads must be 8 or 32");
     return sparse_attn_prefill_impl(q, kv, indices, sm_scale, 512, attn_sink,
-        topk_length, false, false, active_heads);
+        topk_length, false, false, active_heads, extra_kv, extra_indices, extra_topk_length);
 }
 
 STABLE_TORCH_LIBRARY_IMPL(flash_mla_legacy, CUDA, m) {

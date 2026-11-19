@@ -1,6 +1,8 @@
 // Shared M64 .ws pipeline; specialized locally by each wrapper.
-// FLASH_MLA_TARGET == 107 (small heads only) selects the sm_107 copy (namespace small_heads_sm107): 4 KV slots and
-// 2 K RoPE slots in oversized shared memory, small buffers below the KV slots. Compiled for sm_107a / sm_107f only.
+// Wrappers set FLASH_MLA_SMALL_HEADS (0/1) and may set FLASH_MLA_EXTRA_KV (1) before
+// including this file and phase1.cuh, and #undef both afterwards.
+// FLASH_MLA_TARGET == 107 selects the sm_107 copy (namespaces *_sm107): 4 KV slots and 2 K RoPE slots in oversized
+// shared memory, small buffers below the KV slots. Compiled for sm_107a / sm_107f only.
 
 #include <cstddef>
 
@@ -10,22 +12,40 @@
 #include "kernels/defines.h"
 #include "kernels/params.h"
 
-#if FLASH_MLA_TARGET == 107 && !FLASH_MLA_SMALL_HEADS
-#error "FLASH_MLA_TARGET 107 is only implemented for the small-heads kernel"
-#endif
-
-#if FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
+#if FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::small_heads_sm107 {
+#elif FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::small_heads {
+#elif FLASH_MLA_EXTRA_KV && FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::head64_sm107 {
+#elif FLASH_MLA_EXTRA_KV
+namespace legacy::sm100::prefill::sparse_fwd::extra_kv::head64 {
+#elif FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
 namespace legacy::sm100::prefill::sparse_fwd::small_heads_sm107 {
 #elif FLASH_MLA_SMALL_HEADS
 namespace legacy::sm100::prefill::sparse_fwd::small_heads {
-#else // FLASH_MLA_SMALL_HEADS
+#elif FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::head64_sm107 {
+#else
 namespace legacy::sm100::prefill::sparse_fwd::head64 {
-#endif // FLASH_MLA_SMALL_HEADS
+#endif
 
 using namespace cute;
 
-template<SparseAttnFwdMode FWD_MODE, int D_QK>
+#if FLASH_MLA_EXTRA_KV
+using KernelParams = SparseAttnExtraKvFwdParams;
+#elif FLASH_MLA_SMALL_HEADS
+using KernelParams = SparseAttnSmallHeadsFwdParams;
+#else
+using KernelParams = SparseAttnFwdParams;
+#endif
+
+// HAVE_TOPK_LENGTH_ (extra KV cache only): topk_length or extra_topk_length is set, so whole tiles past either
+// length are skipped. Without it the kernel covers every tile of both caches, with no per-query length handling.
+template<SparseAttnFwdMode FWD_MODE, int D_QK, bool HAVE_TOPK_LENGTH_ = false>
 struct KernelTemplate {
+
+static constexpr bool HAVE_TOPK_LENGTH = HAVE_TOPK_LENGTH_;
 
 static constexpr uint32_t B_H = 64;   // Head block size. This kernel only supports h_q == B_H
 
@@ -39,6 +59,9 @@ struct TmaParams {
     Shape_Q_RoPE shape_Q_rope; TMA_Q_RoPE tma_Q_rope;
     Shape_O shape_O; TMA_O tma_O;
     CUtensorMap tensor_map_kv_nope;
+#if FLASH_MLA_EXTRA_KV
+    CUtensorMap tensor_map_extra_kv_nope;
+#endif
 };
 
 static_assert(D_QK == 576 || D_QK == 512);
@@ -216,17 +239,9 @@ enum NamedBarriers : int {
 
 template<typename TmaParam>
 static __device__ void
-#if FLASH_MLA_SMALL_HEADS
-sparse_attn_fwd_kernel_devfunc(const SparseAttnSmallHeadsFwdParams &params, const TmaParam &tma_params);
-#else // FLASH_MLA_SMALL_HEADS
-sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params, const TmaParam &tma_params);
-#endif // FLASH_MLA_SMALL_HEADS
+sparse_attn_fwd_kernel_devfunc(const KernelParams &params, const TmaParam &tma_params);
 
-#if FLASH_MLA_SMALL_HEADS
-static void run(const SparseAttnSmallHeadsFwdParams& params);
-#else // FLASH_MLA_SMALL_HEADS
-static void run(const SparseAttnFwdParams& params);
-#endif // FLASH_MLA_SMALL_HEADS
+static void run(const KernelParams& params);
 
 #if FLASH_MLA_TARGET == 107
 // Whether the current device runs this file's sm_107 binary and has the shared memory this copy needs
