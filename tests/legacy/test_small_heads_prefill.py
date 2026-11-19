@@ -51,6 +51,28 @@ class SmallHeadsPrefillTest(unittest.TestCase):
                         with self.assertRaises(RuntimeError):
                             flash_mla_sparse_fwd_small_heads(q, kv, ids, dim**-0.5, 16)
 
+    def test_several_jobs_per_cta(self):
+        # s_q above the SM count: CTAs fetch further rows by cluster launch control
+        if torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("SM10x required")
+        torch.manual_seed(4102)
+        s_q = 2 * torch.cuda.get_device_properties(0).multi_processor_count + 37
+        for heads in (8, 32):
+            for dim in (512, 576):
+                for topk in (192, 2048):
+                    with self.subTest(heads=heads, dim=dim, topk=topk):
+                        q = torch.zeros(s_q, 64, dim, device="cuda", dtype=torch.bfloat16)
+                        q[:, :heads].normal_()
+                        kv = torch.randn(32768, 1, dim, device="cuda", dtype=torch.bfloat16)
+                        ids = torch.randint(32768, (s_q, 1, topk), device="cuda", dtype=torch.int32)
+                        lengths = torch.randint(topk + 1, (s_q,), device="cuda", dtype=torch.int32)
+                        lengths[0] = 0
+                        ids[1].fill_(-1)
+                        out = flash_mla_sparse_fwd_small_heads(q, kv, ids, dim**-0.5, heads, None, lengths)[0]
+                        ref = flash_mla_sparse_fwd(q, kv, ids, dim**-0.5, topk_length=lengths, use_legacy=True,
+                                                   return_log2_lse=False)[0]
+                        torch.testing.assert_close(out, ref[:, :heads], atol=.03, rtol=.03)
+
 
 if __name__ == "__main__":
     unittest.main()
