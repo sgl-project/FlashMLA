@@ -299,6 +299,9 @@ def flash_mla_sparse_fwd(
     topk_length: Optional[torch.Tensor] = None,
     use_legacy: bool = False,
     return_log2_lse: Optional[bool] = None,
+    extra_kv: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Sparse attention prefill kernel
@@ -321,6 +324,12 @@ def flash_mla_sparse_fwd(
             False is a saving only on the legacy side, where the kernel then skips allocating and
             writing the statistics; the current kernels always write them, so there it only hides
             them to keep the signature uniform.
+        extra_kv and extra_indices: optional, legacy only (SM10x, h_q 64, d_qk 576). If provided, each q token
+            also attends to the tokens extra_indices selects from extra_kv, in the same softmax: the output and
+            statistics are those of attending to both caches' selected tokens together. extra_kv: [extra_s_kv,
+            h_kv, d_qk], bfloat16; extra_indices: [s_q, h_kv, extra_topk], int32, -1 for unused entries. With an
+            extra cache, topk and extra_topk must be >= 128 and divisible by 64.
+        extra_topk_length: optional, [s_q], int32, needs extra_kv. Like topk_length, for extra_indices.
 
     Returns:
         (output, max_logits, lse)
@@ -331,6 +340,14 @@ def flash_mla_sparse_fwd(
             return_log2_lse is False
     """
     ops = get_ops(use_legacy)
+    if extra_kv is not None or extra_indices is not None or extra_topk_length is not None:
+        if not use_legacy:
+            raise ValueError("an extra KV cache is a legacy-kernel feature: pass use_legacy=True")
+        return tuple(ops.sparse_prefill_fwd(
+            q, kv, indices, sm_scale, d_v, attn_sink, topk_length,
+            return_log2_lse is True, return_log2_lse is not False,
+            extra_kv, extra_indices, extra_topk_length,
+        ))
     if not use_legacy:
         assert return_log2_lse is not True, (
             "return_log2_lse=True is a legacy-kernel feature: the current kernels emit both "
@@ -578,12 +595,26 @@ def has_small_heads_prefill() -> bool:
         return False
 
 
-def flash_mla_sparse_fwd_small_heads(q, kv, indices, sm_scale, active_heads, attn_sink=None, topk_length=None):
+def flash_mla_sparse_fwd_small_heads(q, kv, indices, sm_scale, active_heads, attn_sink=None, topk_length=None,
+                                     extra_kv=None, extra_indices=None, extra_topk_length=None):
     """Output-only SM10x BF16 sparse prefill with 8/32 real heads in padded Q64.
 
-    Q and optional sink must be padded to 64 heads; KV has one head. Returns
-    (compact output, None, None). Requires the matching legacy extension build.
+    Q and optional sink must be padded to 64 heads; KV has one head. extra_kv, extra_indices and
+    extra_topk_length (optional, d_qk 576) add an extra KV cache attended in the same softmax, as in
+    flash_mla_sparse_fwd. Returns (compact output, None, None). Requires the matching legacy extension build.
     """
+    if extra_kv is None and extra_indices is None and extra_topk_length is None:
+        return get_ops(True).sparse_prefill_fwd_small_heads(
+            q, kv, indices, sm_scale, active_heads, attn_sink, topk_length
+        )
     return get_ops(True).sparse_prefill_fwd_small_heads(
-        q, kv, indices, sm_scale, active_heads, attn_sink, topk_length
+        q, kv, indices, sm_scale, active_heads, attn_sink, topk_length, extra_kv, extra_indices, extra_topk_length
     )
+
+
+def has_sparse_prefill_extra_kv() -> bool:
+    """Whether the loaded legacy extension's sparse prefill accepts an extra KV cache (extra_kv)."""
+    try:
+        return "extra_kv" in str(get_ops(True).sparse_prefill_fwd_small_heads.default._schema)
+    except (ImportError, OSError, RuntimeError, AttributeError):
+        return False

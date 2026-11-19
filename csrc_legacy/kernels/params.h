@@ -190,6 +190,20 @@ struct SparseAttnSmallHeadsFwdParams : SparseAttnFwdParams {
     int output_heads;
 };
 
+// Prefill with an extra KV cache: each query attends to the tokens selected from kv by indices and,
+// in addition, those selected from extra_kv by extra_indices, in one online softmax (no per-cache
+// output or LSE merge). The KV loop covers the main cache's tiles, then the extra cache's.
+// topk and extra_topk must be multiples of 64 and at least 128. topk_length / extra_topk_length
+// (optional, per query) limit each cache's list; whole tiles past them are skipped.
+struct SparseAttnExtraKvFwdParams : SparseAttnSmallHeadsFwdParams {
+    cutlass::bfloat16_t* __restrict__ extra_kv;   // [extra_s_kv, h_kv, d_qk]
+    int* __restrict__ extra_indices;              // [s_q, h_kv, extra_topk]
+    int* __restrict__ extra_topk_length;          // [s_q], may be nullptr
+    int extra_s_kv, extra_topk;
+    int stride_extra_kv_s_kv;
+    int stride_extra_indices_s_q;
+};
+
 // We have some kernels that implement both prefill and decode modes in a single kernel (with different template instantiations). The following enum helps to distinguish the modes.
 enum class SparseAttnFwdMode {
     Prefill,            // Normal prefill mode
