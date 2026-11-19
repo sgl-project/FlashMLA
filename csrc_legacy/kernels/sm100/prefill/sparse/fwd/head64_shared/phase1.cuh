@@ -18,6 +18,10 @@ I/O: See SparseAttnFwdParams in kernels/params.h
 #endif // FLASH_MLA_SMALL_HEADS
 */
 
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+
 #include <math_constants.h>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/reg_reconfig.h>
@@ -31,7 +35,9 @@ I/O: See SparseAttnFwdParams in kernels/params.h
 #include "kernels/sm100/helpers.h"
 #include "kernels/sm100/common_subroutine.h"
 
-#if FLASH_MLA_SMALL_HEADS
+#if FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::small_heads_sm107 {
+#elif FLASH_MLA_SMALL_HEADS
 namespace legacy::sm100::prefill::sparse_fwd::small_heads {
 #else // FLASH_MLA_SMALL_HEADS
 namespace legacy::sm100::prefill::sparse_fwd::head64 {
@@ -195,8 +201,16 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
         plan.bar_so_ready.init(128);
 #endif // FLASH_MLA_SMALL_HEADS
         if constexpr (HAVE_ROPE) {
+#if FLASH_MLA_TARGET == 107
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_ROPE_BUFS; ++i) {
+                plan.bar_qk_rope_done[i].init(1);
+                plan.bar_kv_rope_ready[i].init(64);
+            }
+#else
             plan.bar_qk_rope_done.init(1);
             plan.bar_kv_rope_ready.init(64);
+#endif
         }
 #if FLASH_MLA_SMALL_HEADS
         plan.bar_o_write_back_done.init(64);
@@ -224,7 +238,11 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
     auto issue_q_rope_tma = [&](int s_q_idx) {
         if constexpr (HAVE_ROPE) {
             Tensor gQ_rope = tma_params.tma_Q_rope.get_tma_tensor(tma_params.shape_Q_rope)(_, _, s_q_idx);
+#if FLASH_MLA_TARGET == 107
+            Tensor sQ_rope = make_tensor(make_smem_ptr(plan.q_rope_slot), SmemLayoutQRoPE{});
+#else
             Tensor sQ_rope = make_tensor(make_smem_ptr(plan.qk_rope_slot), SmemLayoutQRoPE{});
+#endif
             ku::launch_tma_copy(tma_params.tma_Q_rope, gQ_rope, sQ_rope, plan.bar_prologue_q_rope, TMA::CacheHintSm90::EVICT_FIRST);
         }
     };
@@ -237,7 +255,11 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
 
             UMMA::SmemDescriptor sQ_rope_desc = UMMA::make_umma_desc<UMMA::Major::K>(
                 make_tensor(
+#if FLASH_MLA_TARGET == 107
+                    make_smem_ptr(plan.q_rope_slot),
+#else
                     make_smem_ptr(plan.qk_rope_slot),
+#endif
                     tile_to_shape(
                         UMMA::Layout_K_SW64_Atom<bf16>{},
                         Shape<Int<B_H*2>, Int<32>>{}
@@ -719,10 +741,19 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                         // Wait for K (RoPE)
                         // P = Q(rope) @ K(rope)^T
                         if constexpr (HAVE_ROPE) {
+#if FLASH_MLA_TARGET == 107
+                            auto [rope_idx, rope_phase] = rs.get<NUM_ROPE_BUFS>();
+                            Tensor sK_rope_cur = make_tensor(make_smem_ptr(plan.qk_rope_slot + rope_idx*(B_TOPK*(D_Q-D_V))), SmemLayoutKRoPE_TiledMMA{});
+                            plan.bar_kv_rope_ready[rope_idx].wait(rope_phase);
+                            ku::tcgen05_after_thread_sync();
+                            ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope_cur, tP, true);
+                            ku::umma_arrive_noelect(plan.bar_qk_rope_done[rope_idx]);
+#else
                             plan.bar_kv_rope_ready.wait(binary_bar_phase);
                             ku::tcgen05_after_thread_sync();
                             ku::utcmma_ts(tiled_mma_P, tQ_rope, sK_rope, tP, true);
                             ku::umma_arrive_noelect(plan.bar_qk_rope_done);
+#endif
                         }
 
                         // Wait for K (NoPE)
@@ -805,6 +836,33 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                 int group_idx = thread_idx / GROUP_SIZE, idx_in_group = thread_idx % GROUP_SIZE;
                 Tensor sK_rope = make_tensor(make_smem_ptr(plan.qk_rope_slot), SmemLayoutKRoPE{});
                 bf16* sK_rope_base = &sK_rope(group_idx, idx_in_group*8);
+#if FLASH_MLA_TARGET == 107
+                // Q RoPE has its own slot, so the first K RoPE load of a job need not wait for its UTCCP
+                run_outer_loop([&](const OuterloopArgs &args) {
+                    int* gIndices = params.indices + args.s_q_idx*params.stride_indices_s_q; // [topk]
+                    CUTE_NO_UNROLL
+                    for (int k = 0; k < args.num_k_blocks; ++k) {
+                        auto [rope_idx, rope_phase] = rs.get<NUM_ROPE_BUFS>();
+                        bf16* sK_rope_slot_base = sK_rope_base + rope_idx*(B_TOPK*(D_Q-D_V));
+                        int indices[ROWS_PER_THREAD];
+                        CUTE_UNROLL
+                        for (int local_row = 0; local_row < ROWS_PER_THREAD; ++local_row)
+                            indices[local_row] = __ldg(gIndices + k*B_TOPK + group_idx + local_row*NUM_GROUPS);
+                        plan.bar_qk_rope_done[rope_idx].wait(rope_phase^1);
+                        CUTE_UNROLL
+                        for (int local_row = 0; local_row < ROWS_PER_THREAD; ++local_row) {
+                            int index = indices[local_row];
+                            ku::cp_async_cacheglobal<ku::PrefetchSize::B128>(
+                                params.kv + (int64_t)index*params.stride_kv_s_kv + 512 + idx_in_group*8,
+                                sK_rope_slot_base + local_row*NUM_GROUPS*32,
+                                index >= 0 && index < params.s_kv
+                            );
+                        }
+                        cutlass::arch::cpasync_barrier_arrive_noinc((uint64_t*)&(plan.bar_kv_rope_ready[rope_idx]));
+                        rs.update();
+                    }
+                });
+#else
                 run_outer_loop([&](const OuterloopArgs &args) {
                     int* gIndices = params.indices + args.s_q_idx*params.stride_indices_s_q; // [topk]
                     CUTE_NO_UNROLL
@@ -832,6 +890,7 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnF
                         rs.update();
                     }
                 });
+#endif
             }
         }
     }
@@ -850,7 +909,11 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnSmallHeadsFwdParams par
 #else // FLASH_MLA_SMALL_HEADS
 sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __grid_constant__ const TmaParams tma_params) {
 #endif // FLASH_MLA_SMALL_HEADS
+#if FLASH_MLA_TARGET == 107 && !defined(CUTLASS_ARCH_MMA_SM107A_ENABLED) && !defined(CUTLASS_ARCH_MMA_SM107F_ENABLED)
+    // Never launched: can_use_oversized_smem() requires an sm_107 device
+#else
     Kernel::sparse_attn_fwd_kernel_devfunc(params, tma_params);
+#endif
 }
 
 template<FwdMode FWD_MODE, int D_QK>
@@ -949,19 +1012,78 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const SparseAttnFwdParams& params) {
     auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<FWD_MODE, D_QK>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+#if FLASH_MLA_TARGET == 107
+#if CUDART_VERSION >= 13040
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeSharedMemoryMode;
+    attrs[0].val.sharedMemoryMode = cudaSharedMemoryModeAllowOversizedSharedMemory;
+    cudaLaunchConfig_t launch_config = {};
+    launch_config.gridDim = dim3(params.s_q, 1, 1);
+    launch_config.blockDim = dim3(NUM_THREADS, 1, 1);
+    launch_config.dynamicSmemBytes = smem_size;
+    launch_config.stream = params.stream;
+    launch_config.attrs = attrs;
+    launch_config.numAttrs = 1;
+    KU_CUDA_CHECK(cudaLaunchKernelEx(&launch_config, kernel, params, tma_params));
+#else
+    KU_ASSERT(false, "Oversized shared memory requires CUDA 13.4");
+#endif
+#else
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     kernel<<<params.s_q, NUM_THREADS, smem_size, params.stream>>>(params, tma_params);
     KU_CHECK_KERNEL_LAUNCH();
+#endif
 }
 
+#if FLASH_MLA_TARGET == 107
+template<FwdMode FWD_MODE, int D_QK>
+bool KernelTemplate<FWD_MODE, D_QK>::can_use_oversized_smem() {
+#if CUDART_VERSION >= 13040
+    // The library carries sm_107a code whenever it runs on an sm_107 device, so the device check covers the build
+    auto probe = [](int device) -> bool {
+        const char *disable = std::getenv("FLASH_MLA_DISABLE_OVERSIZED_SMEM");
+        if (disable != nullptr && std::strcmp(disable, "1") == 0) {
+            return false;
+        }
+        int major = 0, minor = 0, max_oversized_smem = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&max_oversized_smem, cudaDevAttrOversizedSharedMemoryPerBlock, device) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return false;
+        }
+        return major == 10 && minor == 7 && (size_t)max_oversized_smem >= sizeof(SharedMemoryPlan);
+    };
+    static constexpr int MAX_DEVICES = 16;
+    static std::once_flag probed[MAX_DEVICES];
+    static char supported[MAX_DEVICES];
+    int device = 0;
+    KU_CUDA_CHECK(cudaGetDevice(&device));
+    if (device >= MAX_DEVICES) {
+        return false;
+    }
+    std::call_once(probed[device], [&] { supported[device] = probe(device) ? 1 : 0; });
+    return supported[device] != 0;
+#else
+    return false;
+#endif
+}
+#else
 template<FwdMode FWD_MODE, int D_QK>
 #if FLASH_MLA_SMALL_HEADS
 void run_sparse_fwd_phase1_kernel(const SparseAttnSmallHeadsFwdParams& params) {
+    // The sm_107 copy (small_heads_sm107) is included first by small_heads/phase1.cuh
+    using KernelSm107 = small_heads_sm107::KernelTemplate<FWD_MODE, D_QK>;
+    if (KernelSm107::can_use_oversized_smem()) {
+        KernelSm107::run(params);
+        return;
+    }
 #else // FLASH_MLA_SMALL_HEADS
 void run_sparse_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
 #endif // FLASH_MLA_SMALL_HEADS
     KernelTemplate<FWD_MODE, D_QK>::run(params);
 }
+#endif
 
 }
