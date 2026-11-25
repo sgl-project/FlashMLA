@@ -703,6 +703,13 @@ KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfun
                     o[i].x = o[i].y = 0.0f;
                 output_scale = 1.0f;
             }
+#if FLASH_MLA_TOKEN_PACKING
+            // A token without any valid key can share the tile with tokens that have some. Its rows of O are zero,
+            // but li is zero too and 1/li is not finite: give it the zero output a query without valid keys gets.
+            if (li == 0.0f) {
+                output_scale = 0.0f;
+            }
+#endif
 
             float2 output_scale_float2 = make_float2(output_scale, output_scale);
 
