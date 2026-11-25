@@ -141,7 +141,8 @@ struct CombineParams {
 
 // Union of the top-k lists of `group` consecutive query rows, in the token-packing index format (see
 // SparseAttnDecodeParams::heads_per_group): one output row per group, each slot once, bits 26..30 = the rows of the
-// group that selected it. Entries < 0 are padding. The result does not depend on thread timing.
+// group that selected it. Entries < 0 are padding; a slot repeated within one row is kept once. The result does not
+// depend on thread timing.
 struct SparsePackIndicesParams {
     const int* __restrict__ indices;    // [num_groups*group, topk] with row stride stride_indices
     int64_t stride_indices;
