@@ -1,6 +1,8 @@
 // Shared M64 .ws pipeline; specialized locally by each wrapper.
 // Wrappers set FLASH_MLA_SMALL_HEADS (0/1) and may set FLASH_MLA_EXTRA_KV (1) before
 // including this file and phase1.cuh, and #undef both afterwards.
+// FLASH_MLA_TOKEN_PACKING (1, with FLASH_MLA_SMALL_HEADS 0 and no extra KV) selects the token-packing copy (namespaces
+// token_packing::*): KernelParams gains heads_per_group and there is one K-valid row per token group.
 // FLASH_MLA_TARGET == 107 selects the sm_107 copy (namespaces *_sm107): 4 KV slots and 2 K RoPE slots in oversized
 // shared memory, small buffers below the KV slots. Compiled for sm_107a / sm_107f only.
 
@@ -12,7 +14,14 @@
 #include "kernels/defines.h"
 #include "kernels/params.h"
 
-#if FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
+#if FLASH_MLA_TOKEN_PACKING && (FLASH_MLA_EXTRA_KV || FLASH_MLA_SMALL_HEADS)
+#error "FLASH_MLA_TOKEN_PACKING is built on the 64-head layout without an extra KV cache"
+#endif
+#if FLASH_MLA_TOKEN_PACKING && FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::token_packing::head64_sm107 {
+#elif FLASH_MLA_TOKEN_PACKING
+namespace legacy::sm100::prefill::sparse_fwd::token_packing::head64 {
+#elif FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
 namespace legacy::sm100::prefill::sparse_fwd::extra_kv::small_heads_sm107 {
 #elif FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS
 namespace legacy::sm100::prefill::sparse_fwd::extra_kv::small_heads {
@@ -32,7 +41,9 @@ namespace legacy::sm100::prefill::sparse_fwd::head64 {
 
 using namespace cute;
 
-#if FLASH_MLA_EXTRA_KV
+#if FLASH_MLA_TOKEN_PACKING
+using KernelParams = SparseAttnPackedFwdParams;
+#elif FLASH_MLA_EXTRA_KV
 using KernelParams = SparseAttnExtraKvFwdParams;
 #elif FLASH_MLA_SMALL_HEADS
 using KernelParams = SparseAttnSmallHeadsFwdParams;
@@ -176,7 +187,11 @@ struct SharedMemoryPlan {
         static_assert(B_H <= B_TOPK);
         array_aligned<bf16, B_TOPK*D_V> qko_slots[NUM_BUFS];
     } u;
+#if FLASH_MLA_TOKEN_PACKING
+    alignas(8) char is_k_valid[NUM_BUFS][SPARSE_DECODE_MAX_GROUPS][B_TOPK/8];   // One row per token group
+#else
     char is_k_valid[NUM_BUFS][B_TOPK/8];
+#endif
     transac_bar_t bar_prologue_q_nope, bar_prologue_q_rope, bar_prologue_utccp_nope, bar_prologue_utccp_rope;
     transac_bar_t bar_qk_nope_done[NUM_BUFS], bar_qk_rope_done[NUM_ROPE_BUFS];    // Pi = QKi^T (the nope part) done
     transac_bar_t bar_sv_done[NUM_BUFS];    // O += SiVi done (i.e. O, Si and Vi are free)
@@ -202,7 +217,11 @@ struct SharedMemoryPlan {
     bf16 qk_rope_slot[B_TOPK*(D_Q-D_V)];
     float p_exchange_buf[4][32 * (B_TOPK/(128/B_H))];
     bf16 s[B_H*B_TOPK];
+#if FLASH_MLA_TOKEN_PACKING
+    alignas(8) char is_k_valid[NUM_BUFS][SPARSE_DECODE_MAX_GROUPS][B_TOPK/8];   // One row per token group
+#else
     char is_k_valid[NUM_BUFS][B_TOPK/8];
+#endif
     transac_bar_t bar_prologue_q_nope, bar_prologue_q_rope, bar_prologue_utccp_nope, bar_prologue_utccp_rope;
     transac_bar_t bar_qk_nope_done[NUM_BUFS], bar_qk_rope_done;    // Pi = QKi^T (the nope part) done
     transac_bar_t bar_sv_done[NUM_BUFS];    // O += SiVi done (i.e. O, Si and Vi are free)

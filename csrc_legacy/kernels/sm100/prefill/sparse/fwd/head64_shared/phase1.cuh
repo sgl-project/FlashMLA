@@ -12,7 +12,8 @@ Template parameters:
 Grid: [s_q, 1, 1]
 
 I/O: See KernelParams in config.h (SparseAttnFwdParams, SparseAttnSmallHeadsFwdParams or
-SparseAttnExtraKvFwdParams in kernels/params.h, depending on the wrapper)
+SparseAttnExtraKvFwdParams in kernels/params.h, depending on the wrapper; SparseAttnPackedFwdParams for the
+token-packing copy, FLASH_MLA_TOKEN_PACKING)
 */
 
 #include <cstdlib>
@@ -32,7 +33,14 @@ SparseAttnExtraKvFwdParams in kernels/params.h, depending on the wrapper)
 #include "kernels/sm100/helpers.h"
 #include "kernels/sm100/common_subroutine.h"
 
-#if FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
+#if FLASH_MLA_TOKEN_PACKING && (FLASH_MLA_EXTRA_KV || FLASH_MLA_SMALL_HEADS)
+#error "FLASH_MLA_TOKEN_PACKING is built on the 64-head layout without an extra KV cache"
+#endif
+#if FLASH_MLA_TOKEN_PACKING && FLASH_MLA_TARGET == 107
+namespace legacy::sm100::prefill::sparse_fwd::token_packing::head64_sm107 {
+#elif FLASH_MLA_TOKEN_PACKING
+namespace legacy::sm100::prefill::sparse_fwd::token_packing::head64 {
+#elif FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS && FLASH_MLA_TARGET == 107
 namespace legacy::sm100::prefill::sparse_fwd::extra_kv::small_heads_sm107 {
 #elif FLASH_MLA_EXTRA_KV && FLASH_MLA_SMALL_HEADS
 namespace legacy::sm100::prefill::sparse_fwd::extra_kv::small_heads {
@@ -495,6 +503,11 @@ KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfun
         // Scale & Exp warps
         bf16* sS_base = plan.s + lane_idx*8 + (warp_idx&1)*(B_H/2)*8 + (warp_idx/2)*B_H*(B_TOPK/2);
         static constexpr int NUM_ELEMS_PER_THREAD = B_TOPK / 2;
+#if FLASH_MLA_TOKEN_PACKING
+        // Token packing: this thread's row belongs to token group (head / heads_per_group)
+        const int row_group = params.heads_per_group > 0
+            ? min((idx_in_warpgroup%B_H) / params.heads_per_group, SPARSE_DECODE_MAX_GROUPS-1) : 0;
+#endif
 
         run_outer_loop([&](const OuterloopArgs &args) {
             // The following three numbers are
@@ -529,7 +542,11 @@ KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfun
                     false  // Prefill keeps P in registers (no store_back_p)
                 >(
                     tmem_cols::P,
+#if FLASH_MLA_TOKEN_PACKING
+                    plan.is_k_valid[buf_idx][row_group],
+#else
                     plan.is_k_valid[buf_idx],
+#endif
                     warp_idx, lane_idx,
                     [&]() {plan.bar_p_free.arrive();},
                     plan.p_exchange_buf,
@@ -782,6 +799,15 @@ KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfun
                     CUTE_UNROLL
                     for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
                         indices[local_row] = __ldg((int4*)kv_tile.indices + local_row*NUM_WARPS + warp_idx);
+#if FLASH_MLA_TOKEN_PACKING
+                        if (params.heads_per_group > 0) {   // Strip the token-group bits; negative entries stay padding
+                            constexpr int SLOT_MASK = (1 << SPARSE_DECODE_GROUP_SHIFT) - 1;
+                            if (indices[local_row].x >= 0) indices[local_row].x &= SLOT_MASK;
+                            if (indices[local_row].y >= 0) indices[local_row].y &= SLOT_MASK;
+                            if (indices[local_row].z >= 0) indices[local_row].z &= SLOT_MASK;
+                            if (indices[local_row].w >= 0) indices[local_row].w &= SLOT_MASK;
+                        }
+#endif
                         max_indices = max(max_indices, int4_max(indices[local_row]));
                         min_indices = min(min_indices, int4_min(indices[local_row]));
                     }
@@ -956,6 +982,36 @@ KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfun
                     CUTE_NO_UNROLL
                     for (int k = 0; k < args.num_k_blocks; ++k) {
                         KvTile kv_tile = kv_tiles.get(k);
+#if FLASH_MLA_TOKEN_PACKING
+                        // One validity byte per token group: a slot is valid for group g if it is a valid slot (as
+                        // load_indices_and_generate_mask defines it) and bit g of its token-group bits is set.
+                        // Without packing (heads_per_group == 0) only group 0 is used.
+                        int tile_indices[8];
+                        KU_LDG_256(kv_tile.indices + lane_idx*8, tile_indices, ".nc", "evict_first", "evict_normal", "256B");
+                        char group_masks[SPARSE_DECODE_MAX_GROUPS];
+                        CUTE_UNROLL
+                        for (int g = 0; g < SPARSE_DECODE_MAX_GROUPS; ++g) group_masks[g] = 0;
+                        CUTE_UNROLL
+                        for (int i = 0; i < 8; ++i) {
+                            int index = tile_indices[i];
+                            unsigned group_bits = 1;
+                            if (params.heads_per_group > 0 && index >= 0) {
+                                group_bits = (unsigned)index >> SPARSE_DECODE_GROUP_SHIFT;
+                                index &= (1 << SPARSE_DECODE_GROUP_SHIFT) - 1;
+                            }
+                            bool is_valid = index >= 0 && index < kv_tile.s_kv && (kv_tile.pos_start + lane_idx*8 + i) < kv_tile.topk_length;
+                            CUTE_UNROLL
+                            for (int g = 0; g < SPARSE_DECODE_MAX_GROUPS; ++g)
+                                group_masks[g] |= (char)((is_valid && ((group_bits >> g) & 1)) << i);
+                        }
+
+                        auto [buf_idx, bar_phase] = rs.get<NUM_BUFS>();
+                        plan.bar_k_valid_free[buf_idx].wait(bar_phase^1);
+                        CUTE_UNROLL
+                        for (int g = 0; g < SPARSE_DECODE_MAX_GROUPS; ++g)
+                            plan.is_k_valid[buf_idx][g][lane_idx] = group_masks[g];
+                        plan.bar_k_valid_ready[buf_idx].arrive();
+#else
                         char k_validness_mask = load_indices_and_generate_mask(
                             lane_idx,
                             kv_tile.indices,
@@ -968,6 +1024,7 @@ KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfun
                         plan.bar_k_valid_free[buf_idx].wait(bar_phase^1);
                         plan.is_k_valid[buf_idx][lane_idx] = k_validness_mask;
                         plan.bar_k_valid_ready[buf_idx].arrive();
+#endif
 
                         rs.update();
                     }
@@ -1002,8 +1059,13 @@ KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfun
                         bf16* sK_rope_slot_base = sK_rope_base + rope_idx*(B_TOPK*(D_Q-D_V));
                         int indices[ROWS_PER_THREAD];
                         CUTE_UNROLL
-                        for (int local_row = 0; local_row < ROWS_PER_THREAD; ++local_row)
+                        for (int local_row = 0; local_row < ROWS_PER_THREAD; ++local_row) {
                             indices[local_row] = __ldg(kv_tile.indices + group_idx + local_row*NUM_GROUPS);
+#if FLASH_MLA_TOKEN_PACKING
+                            if (params.heads_per_group > 0 && indices[local_row] >= 0)
+                                indices[local_row] &= (1 << SPARSE_DECODE_GROUP_SHIFT) - 1;
+#endif
+                        }
                         plan.bar_qk_rope_done[rope_idx].wait(rope_phase^1);
                         CUTE_UNROLL
                         for (int local_row = 0; local_row < ROWS_PER_THREAD; ++local_row) {
@@ -1027,8 +1089,13 @@ KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfun
                         auto [_, binary_bar_phase] = rs.get<1>();
                         int indices[ROWS_PER_THREAD];
                         CUTE_UNROLL
-                        for (int local_row = 0; local_row < ROWS_PER_THREAD; ++local_row)
+                        for (int local_row = 0; local_row < ROWS_PER_THREAD; ++local_row) {
                             indices[local_row] = __ldg(kv_tile.indices + group_idx + local_row*NUM_GROUPS);
+#if FLASH_MLA_TOKEN_PACKING
+                            if (params.heads_per_group > 0 && indices[local_row] >= 0)
+                                indices[local_row] &= (1 << SPARSE_DECODE_GROUP_SHIFT) - 1;
+#endif
+                        }
                         plan.bar_qk_rope_done.wait(binary_bar_phase^1);
                         if (k == 0) {
                             plan.bar_prologue_utccp_rope.wait(args.outer_loop_phase); // Wait for Q RoPE's UTCCP so that qk_rope_slot is empty
@@ -1081,7 +1148,11 @@ void KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::run(const KernelParams& 
     KU_ASSERT(params.extra_topk % B_TOPK == 0);
     KU_ASSERT(params.extra_topk >= 128);
 #endif
-    KU_ASSERT(params.h_q == 64);
+    // The Q tensor maps below are built from h_q, so the rows of the 64-row tile past h_q load as zeros, and neither the
+    // output tensor map nor the statistics stores (is_padding_row) reach past the real rows: the kernel takes any
+    // 1 <= h_q <= 64. The existing entry points keep requiring Q padded to 64 heads (csrc_legacy/api/sparse_prefill.cpp);
+    // sparse_prefill_fwd_packed is the one that passes fewer.
+    KU_ASSERT(params.h_q >= 1 && params.h_q <= 64);
     KU_ASSERT(params.d_qk == D_QK);
     static_assert(D_QK == 576 || D_QK == 512);
 

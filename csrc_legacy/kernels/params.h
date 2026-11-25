@@ -139,6 +139,30 @@ struct CombineParams {
     cudaStream_t stream;
 };
 
+// Union of the top-k lists of `group` consecutive query rows, in the token-packing index format (see
+// SparseAttnDecodeParams::heads_per_group): one output row per group, each slot once, bits 26..30 = the rows of the
+// group that selected it. Entries < 0 are padding. The result does not depend on thread timing.
+struct SparsePackIndicesParams {
+    const int* __restrict__ indices;    // [num_groups*group, topk] with row stride stride_indices
+    int64_t stride_indices;
+    int topk, group;
+    int* __restrict__ packed;           // [num_groups, >= max(128, group*topk rounded up to 64)] with row stride stride_packed
+    int stride_packed;
+    int* __restrict__ lengths;          // [num_groups]: number of distinct slots of each group
+    int num_groups;
+    cudaStream_t stream;
+};
+
+// V3.2 FP8 pages (656 B per token: 512 e4m3 NoPE, 4 fp32 scales, 64 bf16 RoPE) -> bf16 rows of 576
+struct DequantV32Params {
+    const uint8_t* __restrict__ kv;     // [num_pages, 64, 1, 656] with page stride stride_page (bytes)
+    int64_t stride_page;
+    const int* __restrict__ rows;       // [n] slot ids, or nullptr for slots 0..n-1
+    uint16_t* __restrict__ out;         // [n, 1, 576] bf16, contiguous
+    int64_t n;
+    cudaStream_t stream;
+};
+
 struct GetDecodeSchedMetaParams {
     int b;  // batch size
     int s_q;
@@ -188,6 +212,17 @@ struct SparseAttnFwdParams {
 struct SparseAttnSmallHeadsFwdParams : SparseAttnFwdParams {
     int active_heads;
     int output_heads;
+};
+
+// Prefill with token packing (the token_packing copy of the shared 64-head kernel): Q is [s_q, h_q, d_qk] with
+// 1 <= h_q <= 64 real rows (no padding to 64) and out is [s_q, h_q, d_v], provided by the caller.
+// heads_per_group > 0: each q "token" holds up to SPARSE_DECODE_MAX_GROUPS real tokens' heads, heads_per_group rows
+// each, and an index carries in bits 26..30 which of those tokens attend to it, exactly as in sparse decode (see
+// SparseAttnDecodeParams::heads_per_group and SPARSE_DECODE_GROUP_SHIFT); slots must then stay below 1 << 26.
+// heads_per_group == 0: indices are plain slots and every row attends to every valid one.
+// Separate parameter type preserves the layouts of the existing prefill kernels.
+struct SparseAttnPackedFwdParams : SparseAttnFwdParams {
+    int heads_per_group;
 };
 
 // Prefill with an extra KV cache: each query attends to the tokens selected from kv by indices and,
