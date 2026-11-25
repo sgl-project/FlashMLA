@@ -618,3 +618,124 @@ def has_sparse_prefill_extra_kv() -> bool:
         return "extra_kv" in str(get_ops(True).sparse_prefill_fwd_small_heads.default._schema)
     except (ImportError, OSError, RuntimeError, AttributeError):
         return False
+
+
+# Token packing for sparse prefill: bits 26..30 of a packed index say which tokens of its group selected the slot
+# (SPARSE_DECODE_GROUP_SHIFT / SPARSE_DECODE_MAX_GROUPS in csrc_legacy/kernels/params.h).
+SPARSE_PREFILL_PACK_GROUP_SHIFT = 26
+SPARSE_PREFILL_PACK_MAX_GROUPS = 5
+
+
+def has_sparse_prefill_token_packing() -> bool:
+    """Whether the loaded legacy extension provides sparse prefill with token packing (flash_mla_sparse_fwd_packed,
+    flash_mla_sparse_pack_indices and flash_mla_dequant_v32_kv)."""
+    try:
+        ops = get_ops(True)
+        return (
+            hasattr(ops, "sparse_prefill_fwd_packed")
+            and hasattr(ops, "sparse_prefill_pack_indices")
+            and hasattr(ops, "dequant_v32_kv")
+        )
+    except (ImportError, OSError, RuntimeError, AttributeError):
+        return False
+
+
+def flash_mla_sparse_fwd_packed(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    heads_per_group: int = 0,
+    topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Output-only SM10x BF16 sparse prefill on the real head count, with optional token packing. Legacy extension.
+
+    With tensor parallelism a rank holds h < 64 query heads, and the 64-row tile of the sparse prefill kernel is
+    mostly padding. Token packing puts G = min(64 // h, 5) consecutive tokens' heads into one tile: the tile attends
+    to the union of their top-k lists, and each token's rows only see the entries that token selected.
+
+    Args:
+        q: [s_q, h_q, 576], bfloat16, 1 <= h_q <= 64. No padding to 64 heads. With packing, s_q counts groups and
+            h_q = G * heads_per_group: a view of the [T, h, 576] query of T = s_q * G tokens.
+        kv: [s_kv, 1, 576], bfloat16 (flash_mla_dequant_v32_kv makes it from V3.2 FP8 pages). With packing,
+            s_kv <= 2**26.
+        indices: [s_q, 1, topk], int32, topk >= 128 and divisible by 64; -1 (or any number < 0) for unused entries.
+            With packing, the lists flash_mla_sparse_pack_indices builds, unsqueezed: bits 26..30 of an entry say
+            which tokens of the group attend to it.
+        sm_scale: float
+        heads_per_group: 0 (the default) for plain indices, or the number of heads per token for token packing;
+            h_q <= 5 * heads_per_group.
+        topk_length: optional, [s_q], int32. As in flash_mla_sparse_fwd; with packing, the `lengths` of
+            flash_mla_sparse_pack_indices.
+        out: optional, [s_q, h_q, 512], bfloat16, contiguous. Written in place and returned, so that packed groups
+            and the rows left over when T is not a multiple of G can land in one [T, h, 512] tensor without a copy.
+
+    Returns:
+        out: [s_q, h_q, 512], bfloat16. No max_logits / lse, and no attention sink.
+
+    With packing a token's keys are accumulated in the order of its group's union list, not of its own list, so the
+    output is not bitwise equal to the unpacked call's; it is run-to-run deterministic for a given grouping.
+    """
+    if out is None:
+        out = q.new_empty((q.shape[0], q.shape[1], 512))
+    get_ops(True).sparse_prefill_fwd_packed(q, kv, indices, sm_scale, heads_per_group, topk_length, out)
+    return out
+
+
+def flash_mla_sparse_pack_indices(
+    indices: torch.Tensor,
+    group: int,
+    packed: Optional[torch.Tensor] = None,
+    lengths: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Packed index lists for flash_mla_sparse_fwd_packed. Legacy extension.
+
+    Args:
+        indices: [T, topk], int32, T divisible by group; entries < 0 are unused, the others must be below 2**26.
+            group * topk <= 12288. A slot that appears twice in one row is kept once, so a row's entries should be
+            distinct (the unpacked kernels would attend to such a slot twice).
+        group: tokens per group, 1..5.
+        packed: optional workspace, [>= T // group, W], int32, contiguous, W divisible by 64 and at least
+            max(128, group * topk rounded up to 64).
+        lengths: optional workspace, [>= T // group], int32, contiguous.
+
+    Returns:
+        (packed, lengths), the workspaces if given. Row g of packed holds, in its first lengths[g] entries, each
+        slot the rows g * group .. (g + 1) * group - 1 of indices select, once, with bit 26 + j set if row
+        g * group + j selects it; the entries up to the next multiple of 64 (at least 128) are -1 and anything
+        after that is left as it was, so pass lengths as topk_length. The result does not depend on thread timing:
+        the same indices give the same lists.
+    """
+    num_groups = indices.shape[0] // group
+    if packed is None:
+        width = max(128, (group * indices.shape[1] + 63) // 64 * 64)
+        packed = indices.new_empty((num_groups, width))
+    if lengths is None:
+        lengths = indices.new_empty((num_groups,))
+    get_ops(True).sparse_prefill_pack_indices(indices, group, packed, lengths)
+    return packed, lengths
+
+
+def flash_mla_dequant_v32_kv(
+    kv: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    rows: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """V3.2 FP8 KV pages to the bf16 rows the sparse prefill kernels read. Legacy extension.
+
+    Args:
+        kv: [num_pages, 64, 1, 656] with contiguous pages: per token 512 e4m3 NoPE values, 4 float32 scales (one per
+            128 values) and 64 bfloat16 RoPE values.
+        out: optional, [n, 1, 576], bfloat16, contiguous. Defaults to every slot (n = num_pages * 64) when rows is
+            None, and to one row per entry of rows otherwise.
+        rows: optional, [>= n], int32, contiguous: out[i] is slot rows[i]. None: out[i] is slot i.
+
+    Returns:
+        out: NoPE as bfloat16(float32(e4m3) * scale), RoPE copied.
+    """
+    if out is None:
+        n = kv.shape[0] * 64 if rows is None else rows.shape[0]
+        out = torch.empty((n, 1, 576), dtype=torch.bfloat16, device=kv.device)
+    get_ops(True).dequant_v32_kv(kv, rows, out)
+    return out

@@ -20,6 +20,7 @@ LEGACY_API_SOURCES = [
     "csrc_legacy/ops.cpp",
     "csrc_legacy/sched_meta.cpp",
     "csrc_legacy/api/sparse_prefill.cpp",
+    "csrc_legacy/api/sparse_prefill_packed.cpp",
     "csrc_legacy/api/sparse_decode.cpp",
     "csrc_legacy/api/dense_decode.cpp",
     "csrc_legacy/api/fused_norm_rope_attn_rope_cast_fwd.cpp",
