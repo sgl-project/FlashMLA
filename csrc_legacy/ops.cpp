@@ -35,10 +35,7 @@ STABLE_TORCH_LIBRARY(flash_mla_legacy, m) {
           "int active_heads, Tensor? attn_sink=None, Tensor? topk_length=None, Tensor? extra_kv=None, "
           "Tensor? extra_indices=None, Tensor? extra_topk_length=None) -> Tensor?[]");
 
-    // Output-only sparse prefill on the real head count (1..64 rows per query, no padding) into the caller's `out`.
-    // `heads_per_group > 0` turns on token packing (SM100, d_qk 576), see SparseAttnPackedFwdParams::heads_per_group;
-    // `sparse_prefill_pack_indices` builds the packed index lists it reads, and `dequant_v32_kv` the bf16 rows from
-    // V3.2 FP8 pages.
+    // `heads_per_group > 0` turns on token packing over the lists `sparse_prefill_pack_indices` builds.
     m.def("sparse_prefill_fwd_packed(Tensor q, Tensor kv, Tensor indices, float sm_scale, int heads_per_group, "
           "Tensor? topk_length, Tensor(a!) out) -> ()");
     m.def("sparse_prefill_pack_indices(Tensor indices, int group, Tensor(a!) packed, Tensor(b!) lengths) -> ()");

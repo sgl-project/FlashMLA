@@ -12,8 +12,7 @@ Template parameters:
 Grid: [s_q, 1, 1]
 
 I/O: See KernelParams in config.h (SparseAttnFwdParams, SparseAttnSmallHeadsFwdParams or
-SparseAttnExtraKvFwdParams in kernels/params.h, depending on the wrapper; SparseAttnPackedFwdParams for the
-token-packing copy, FLASH_MLA_TOKEN_PACKING)
+SparseAttnExtraKvFwdParams in kernels/params.h, depending on the wrapper)
 */
 
 #include <cstdlib>
@@ -504,7 +503,6 @@ KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfun
         bf16* sS_base = plan.s + lane_idx*8 + (warp_idx&1)*(B_H/2)*8 + (warp_idx/2)*B_H*(B_TOPK/2);
         static constexpr int NUM_ELEMS_PER_THREAD = B_TOPK / 2;
 #if FLASH_MLA_TOKEN_PACKING
-        // Token packing: this thread's row belongs to token group (head / heads_per_group)
         const int row_group = params.heads_per_group > 0
             ? min((idx_in_warpgroup%B_H) / params.heads_per_group, SPARSE_DECODE_MAX_GROUPS-1) : 0;
 #endif
@@ -704,8 +702,7 @@ KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfun
                 output_scale = 1.0f;
             }
 #if FLASH_MLA_TOKEN_PACKING
-            // A token without any valid key can share the tile with tokens that have some. Its rows of O are zero,
-            // but li is zero too and 1/li is not finite: give it the zero output a query without valid keys gets.
+            // A token without valid keys in a tile that has some: li == 0 and 1/li is not finite
             if (li == 0.0f) {
                 output_scale = 0.0f;
             }
@@ -990,9 +987,7 @@ KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::sparse_attn_fwd_kernel_devfun
                     for (int k = 0; k < args.num_k_blocks; ++k) {
                         KvTile kv_tile = kv_tiles.get(k);
 #if FLASH_MLA_TOKEN_PACKING
-                        // One validity byte per token group: a slot is valid for group g if it is a valid slot (as
-                        // load_indices_and_generate_mask defines it) and bit g of its token-group bits is set.
-                        // Without packing (heads_per_group == 0) only group 0 is used.
+                        // As load_indices_and_generate_mask, with one validity byte per token group
                         int tile_indices[8];
                         KU_LDG_256(kv_tile.indices + lane_idx*8, tile_indices, ".nc", "evict_first", "evict_normal", "256B");
                         char group_masks[SPARSE_DECODE_MAX_GROUPS];
@@ -1155,10 +1150,6 @@ void KernelTemplate<FWD_MODE, D_QK, HAVE_TOPK_LENGTH_>::run(const KernelParams& 
     KU_ASSERT(params.extra_topk % B_TOPK == 0);
     KU_ASSERT(params.extra_topk >= 128);
 #endif
-    // The Q tensor maps below are built from h_q, so the rows of the 64-row tile past h_q load as zeros, and neither the
-    // output tensor map nor the statistics stores (is_padding_row) reach past the real rows: the kernel takes any
-    // 1 <= h_q <= 64. The existing entry points keep requiring Q padded to 64 heads (csrc_legacy/api/sparse_prefill.cpp);
-    // sparse_prefill_fwd_packed is the one that passes fewer.
     KU_ASSERT(params.h_q >= 1 && params.h_q <= 64);
     KU_ASSERT(params.d_qk == D_QK);
     static_assert(D_QK == 576 || D_QK == 512);

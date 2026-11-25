@@ -10,14 +10,6 @@
 
 #include "kernels/utils.h"
 
-/*
-Dequantization of V3.2 FP8 KV rows to bf16.
-
-A V3.2 token is 656 bytes: 512 e4m3 NoPE values, 4 fp32 scales (one per 128 values) and 64 bf16 RoPE values. Each
-output row is 576 bf16: NoPE as bf16(float(e4m3) * scale), RoPE copied. One warp per row, rows taken in a strided
-loop so that a fixed grid covers any n; lane l converts NoPE bytes [16l, 16l + 16) and lanes 0..7 copy the RoPE tail.
-*/
-
 namespace legacy::smxx::prefill {
 
 namespace {

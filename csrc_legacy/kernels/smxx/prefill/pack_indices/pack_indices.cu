@@ -8,23 +8,7 @@
 
 #include "kernels/utils.h"
 
-/*
-Index packing for token-packed sparse attention.
-
-One CTA per group of `group` consecutive query rows. It writes the union of their top-k slots, each slot once and
-tagged in bits 26..30 with the rows of the group that selected it (SPARSE_DECODE_GROUP_SHIFT, the format sparse decode
-and the token-packing prefill kernel read).
-
-The result is deterministic:
-- Phase 1 inserts the slots into a hash table by prioritized linear probing: a larger slot id displaces a smaller one
-  along the probe sequence. The final layout of such a table does not depend on the insertion order (Shun & Blelloch,
-  "Phase-concurrent hash tables for determinism", SPAA 2014).
-- Phase 2 ORs the row bits into the entries, which no longer move.
-- The output is the table's non-empty entries in table order.
-
-Only the tail of the last 64-entry block is filled with -1 (and the first two blocks, which the attention kernel
-always reads), not the whole output row; the number of distinct slots goes to `lengths`.
-*/
+// Prioritized linear probing: the table layout does not depend on the insertion order (Shun & Blelloch, SPAA 2014)
 
 namespace legacy::smxx::prefill {
 
@@ -49,7 +33,6 @@ sparse_pack_indices_kernel(const SparsePackIndicesParams params) {
     for (int i = tid; i < TABLE_SIZE; i += NUM_THREADS) table[i] = -1;
     __syncthreads();
     const int num_entries = params.group * params.topk;
-    // Phase 1: the slots, in an order-independent layout
     for (int e = tid; e < num_entries; e += NUM_THREADS) {
         int v = params.indices[(first_row + e / params.topk) * params.stride_indices + e % params.topk];
         if (v < 0) continue;
@@ -67,7 +50,7 @@ sparse_pack_indices_kernel(const SparsePackIndicesParams params) {
         }
     }
     __syncthreads();
-    // Phase 2: which rows of the group selected each slot
+    // The entries no longer move: OR in the rows of the group that selected each slot
     for (int e = tid; e < num_entries; e += NUM_THREADS) {
         int v = params.indices[(first_row + e / params.topk) * params.stride_indices + e % params.topk];
         if (v < 0) continue;
@@ -77,7 +60,6 @@ sparse_pack_indices_kernel(const SparsePackIndicesParams params) {
         atomicOr(&table[i], 1 << (SPARSE_DECODE_GROUP_SHIFT + e / params.topk));
     }
     __syncthreads();
-    // Compaction in table order
     int vals[ENTRIES_PER_THREAD], cnt = 0;
     #pragma unroll
     for (int j = 0; j < ENTRIES_PER_THREAD; ++j) {

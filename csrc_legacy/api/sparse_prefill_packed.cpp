@@ -8,14 +8,6 @@
 #include "kernels/smxx/prefill/dequant_v32/dequant_v32.h"
 #include "kernels/smxx/prefill/pack_indices/pack_indices.h"
 
-// Output-only sparse MLA prefill on bf16 KV with the real head count and, optionally, token packing.
-//
-// q [s_q, h_q, 576] holds 1 <= h_q <= 64 real rows per query (no padding to 64 heads) and `out` [s_q, h_q, 512] is the
-// caller's, so that a caller who packs G tokens of h heads into one query passes views of its [T, h, *] tensors.
-// heads_per_group > 0: token packing, see SparseAttnPackedFwdParams. `indices` is then a packed list
-// (sparse_prefill_pack_indices) and `topk_length` its length.
-// heads_per_group == 0: plain indices. With h_q <= 32 this is the small-heads kernel on h_q rows, otherwise the
-// token-packing copy with packing off.
 void sparse_prefill_fwd_packed(
     const Tensor &q,
     const Tensor &kv,
@@ -107,8 +99,6 @@ void sparse_prefill_fwd_packed(
         return;
     }
     if (heads_per_group == 0 && h_q <= 32) {
-        // Rows 32..63 of the tile are padding: the small-heads specialization drops their softmax warps. It runs on
-        // the real head count here, h_q rows loaded and stored, so there is no Q padding and no output trim.
         SparseAttnSmallHeadsFwdParams small_heads_params{};
         static_cast<SparseAttnFwdParams&>(small_heads_params) = params;
         small_heads_params.active_heads = h_q;
@@ -122,9 +112,6 @@ void sparse_prefill_fwd_packed(
     }
 }
 
-// Packed index lists for sparse_prefill_fwd_packed: the union of the top-k lists of each `group` consecutive rows of
-// `indices` [T, topk] (T divisible by group), written to `packed` [>= T / group, W] with W >= max(128, group * topk
-// rounded up to 64) and its length to `lengths` [>= T / group]. See SparsePackIndicesParams.
 void sparse_prefill_pack_indices(const Tensor &indices, int64_t group, const Tensor &packed, const Tensor &lengths) {
     KU_CHECK_NDIM(indices, 2);
     KU_CHECK_NDIM(packed, 2);
@@ -169,8 +156,6 @@ void sparse_prefill_pack_indices(const Tensor &indices, int64_t group, const Ten
     legacy::smxx::prefill::run_sparse_pack_indices_kernel(params);
 }
 
-// V3.2 FP8 KV pages [num_pages, 64, 1, 656] -> bf16 `out` [n, 1, 576] for the bf16 sparse prefill kernels: row i is
-// slot rows[i] (int32, [>= n]), or slot i when rows is None. See DequantV32Params.
 void dequant_v32_kv(const Tensor &kv, const std::optional<Tensor> &rows, const Tensor &out) {
     KU_CHECK_NDIM(kv, 4);
     KU_CHECK_NDIM(rows, 1);

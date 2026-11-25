@@ -1,8 +1,4 @@
-"""SM10x checks for sparse MLA prefill with token packing (flash_mla_sparse_fwd_packed, flash_mla_sparse_pack_indices,
-flash_mla_dequant_v32_kv).
-
-Run against the newly built wheel: python tests/legacy/test_sparse_prefill_token_packing.py.
-"""
+"""SM10x checks for sparse MLA prefill with token packing."""
 import unittest
 
 import torch
@@ -26,8 +22,7 @@ def _group_size(heads):
 
 
 def _reference(q, kv, ids, length=None, chunk=64):
-    """FP32 softmax over each token's own selected keys, honoring -1 / out-of-range slots and lengths. A token with
-    no valid key gets zeros."""
+    """FP32 softmax over each token's own selected keys."""
     out = []
     for start in range(0, q.shape[0], chunk):
         rows = slice(start, min(start + chunk, q.shape[0]))
@@ -45,15 +40,13 @@ def _reference(q, kv, ids, length=None, chunk=64):
 
 
 def _inputs(tokens, heads, topk, s_kv, seed, shared=0.6):
-    """Query, KV and per-token index lists whose entries are distinct within a row and overlap between neighbours:
-    `shared` of every list comes from a window that moves slowly with the token, the rest from anywhere."""
+    """Index lists that are distinct within a row and overlap between neighbouring tokens."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     q = torch.randn(tokens, heads, 576, generator=g, device="cuda").to(torch.bfloat16)
     kv = torch.randn(s_kv, 1, 576, generator=g, device="cuda").to(torch.bfloat16)
     ids = torch.empty(tokens, topk, device="cuda", dtype=torch.int32)
     window = min(s_kv, 2 * topk)
     for t in range(tokens):
-        # A random order of all slots, with the slots of this token's window moved to the front
         order = torch.randperm(s_kv, generator=g, device="cuda")
         start = (t * 7) % (s_kv - window + 1)
         in_window = (order >= start) & (order < start + window)
@@ -64,7 +57,7 @@ def _inputs(tokens, heads, topk, s_kv, seed, shared=0.6):
 
 
 def _add_edge_rows(ids, s_kv):
-    """Empty rows, masked tails and an out-of-range slot. Returns per-token lengths (number of leading valid entries)."""
+    """Empty rows, masked tails and an out-of-range slot. Returns per-token lengths."""
     tokens, topk = ids.shape
     if tokens > 0:
         ids[0].fill_(-1)
@@ -80,8 +73,7 @@ def _add_edge_rows(ids, s_kv):
 
 
 def _run_packed(q, kv, ids, lengths, heads, packed=None, pack_lengths=None):
-    """What a caller does for T tokens of `heads` heads: T // G groups through the packed kernel and the T % G rows
-    left over through the unpacked one, into one output tensor."""
+    """T // G groups through the packed kernel, the T % G rows left over through the unpacked one."""
     tokens = q.shape[0]
     group = _group_size(heads)
     n = tokens // group
@@ -111,8 +103,6 @@ class SparsePrefillTokenPackingTest(unittest.TestCase):
             self.skipTest("SM10x required")
         self.assertTrue(has_sparse_prefill_token_packing())
         self.many_rows = 2 * torch.cuda.get_device_properties(0).multi_processor_count + 37
-
-    # ---- flash_mla_sparse_pack_indices ----------------------------------------------------------------------
 
     def _check_pack(self, ids, group, packed, lengths):
         tokens, topk = ids.shape
@@ -149,7 +139,7 @@ class SparsePrefillTokenPackingTest(unittest.TestCase):
                     self.assertEqual(packed.shape, (4, max(128, (group * topk + 63) // 64 * 64)))
                     self._check_pack(ids, group, packed, lengths)
 
-                    # The same lists whatever the order of a row's entries, the launch, or the workspace's contents
+                    # Same lists for any entry order and any workspace contents
                     shuffled = ids[:, torch.randperm(topk, device="cuda")].contiguous()
                     again, again_lengths = flash_mla_sparse_pack_indices(shuffled, group)
                     workspace = torch.full((6, packed.shape[1] + 64), 12345, device="cuda", dtype=torch.int32)
@@ -181,8 +171,6 @@ class SparsePrefillTokenPackingTest(unittest.TestCase):
             flash_mla_sparse_pack_indices(ids, 5, torch.empty((2, 512), device="cuda", dtype=torch.int32))
         with self.assertRaises(RuntimeError):
             flash_mla_sparse_pack_indices(torch.zeros((5, 4096), device="cuda", dtype=torch.int32), 5)
-
-    # ---- flash_mla_dequant_v32_kv ---------------------------------------------------------------------------
 
     def test_dequant_v32(self):
         g = torch.Generator(device="cuda").manual_seed(7)
@@ -217,8 +205,6 @@ class SparsePrefillTokenPackingTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             flash_mla_dequant_v32_kv(kv, out=torch.empty(pages * 64 + 1, 1, 576, device="cuda", dtype=torch.bfloat16))
 
-    # ---- flash_mla_sparse_fwd_packed ------------------------------------------------------------------------
-
     def test_packed_matches_reference_and_unpacked(self):
         for heads in (8, 12, 16, 32):
             group = _group_size(heads)
@@ -236,7 +222,7 @@ class SparsePrefillTokenPackingTest(unittest.TestCase):
                         self.assertLess(_rel_l2(out, ref), 1e-2)
                         self.assertEqual(int(out[0].abs().max()), 0)   # a token with no key at all
 
-                        # The unpacked call on the real head count, and the existing kernel on Q padded to 64 heads
+                        # Unpacked call, and the existing kernel on Q padded to 64 heads
                         plain = flash_mla_sparse_fwd_packed(q, kv, ids.unsqueeze(1), SCALE, 0, lengths)
                         self.assertEqual(plain.shape, (tokens, heads, 512))
                         torch.testing.assert_close(plain.float(), ref, atol=.03, rtol=.03)
@@ -247,7 +233,7 @@ class SparsePrefillTokenPackingTest(unittest.TestCase):
                         torch.testing.assert_close(plain, padded[:, :heads], atol=.03, rtol=.03)
                         torch.testing.assert_close(out, padded[:, :heads], atol=.03, rtol=.03)
 
-                        # Packing is run-to-run deterministic, also through a reused workspace
+                        # Deterministic through a reused workspace
                         width = max(128, (group * topk + 63) // 64 * 64)
                         workspace = torch.full((tokens // group + 3, width + 128), 777, device="cuda", dtype=torch.int32)
                         workspace_lengths = torch.zeros(tokens // group + 3, device="cuda", dtype=torch.int32)
@@ -255,7 +241,7 @@ class SparsePrefillTokenPackingTest(unittest.TestCase):
                         self.assertTrue(torch.equal(out, again))
 
     def test_partial_group(self):
-        # The last group holds fewer than G tokens: its missing tokens are zero rows of Q with empty index lists
+        # Missing tokens of the last group are zero rows of Q with empty index lists
         for heads in (12, 32):
             group = _group_size(heads)
             for real in range(1, group):
@@ -278,7 +264,6 @@ class SparsePrefillTokenPackingTest(unittest.TestCase):
                     self.assertEqual(int(out[tokens:].abs().max()), 0)
 
     def test_head_counts_that_do_not_fill_the_tile(self):
-        # 12 heads x 5 tokens = 60 rows, 24 heads x 2 tokens = 48 rows, and a group narrower than 64 // heads allows
         for heads, group in ((12, 5), (24, 2), (12, 3), (20, 3), (64, 1)):
             with self.subTest(heads=heads, group=group):
                 tokens = group * 9
@@ -292,7 +277,6 @@ class SparsePrefillTokenPackingTest(unittest.TestCase):
                 torch.testing.assert_close(out.float(), ref, atol=.03, rtol=.03)
 
     def test_disjoint_and_identical_lists(self):
-        # No shared key at all (the union is G times a list) and all keys shared (the union is one list)
         heads, group, topk = 12, 5, 128
         tokens = group * 6
         q, kv, _ = _inputs(tokens, heads, topk, 8192, seed=11)
@@ -308,7 +292,7 @@ class SparsePrefillTokenPackingTest(unittest.TestCase):
                 torch.testing.assert_close(out.float(), _reference(q, kv, ids), atol=.03, rtol=.03)
 
     def test_several_jobs_per_cta_and_graph_replay(self):
-        # More groups than SMs, so CTAs fetch further rows by cluster launch control; then the same launches replayed
+        # More groups than SMs, so CTAs fetch further rows by cluster launch control
         heads, group, topk = 12, 5, 2048
         tokens = self.many_rows * group + 3
         q, kv, ids = _inputs(tokens, heads, topk, 32768, seed=5)

@@ -1,8 +1,7 @@
 // Shared M64 .ws pipeline; specialized locally by each wrapper.
 // Wrappers set FLASH_MLA_SMALL_HEADS (0/1) and may set FLASH_MLA_EXTRA_KV (1) before
 // including this file and phase1.cuh, and #undef both afterwards.
-// FLASH_MLA_TOKEN_PACKING (1, with FLASH_MLA_SMALL_HEADS 0 and no extra KV) selects the token-packing copy (namespaces
-// token_packing::*): KernelParams gains heads_per_group and there is one K-valid row per token group.
+// FLASH_MLA_TOKEN_PACKING (1) selects the token-packing copy (namespaces token_packing::*).
 // FLASH_MLA_TARGET == 107 selects the sm_107 copy (namespaces *_sm107): 4 KV slots and 2 K RoPE slots in oversized
 // shared memory, small buffers below the KV slots. Compiled for sm_107a / sm_107f only.
 
